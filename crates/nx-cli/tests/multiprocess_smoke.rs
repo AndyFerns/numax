@@ -210,17 +210,32 @@ fn restart_and_print_counter(nx: &Path, wasm: &Path, data_dir: &Path, label: &st
 #[test]
 fn serve_without_module_waits_for_sigterm_and_shuts_down_cleanly() {
     let data_dir = temp_path("serve-no-module");
+    let log_path = temp_path("serve-no-module.log");
     let nx = nx_bin();
     let mut node = Command::new(&nx)
         .arg("serve")
+        .env("RUST_LOG", "nx_core=debug")
         .arg("--datastore-path")
         .arg(&data_dir)
-        .stdout(Stdio::piped())
+        .stdout(std::fs::File::create(&log_path).unwrap())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn nx serve");
 
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    // Wait for installed handlers rather than assuming startup takes less than 150 ms.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        if log.contains("shutdown signal handlers installed") {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = node.kill();
+            let _ = node.wait();
+            panic!("nx serve did not install signal handlers: {log}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     assert!(
         node.try_wait().expect("poll nx serve").is_none(),
         "nx serve exited before receiving a shutdown signal"
@@ -394,6 +409,125 @@ fn serve_starts_authenticated_management_listener_and_stops_it_on_sigterm() {
     send_signal(node.id(), "TERM");
     let output = node.wait_with_output().expect("wait for nx serve");
     assert_success(&output, "nx serve with management API");
+    assert!(TcpStream::connect(listen).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn management_cancels_looping_guests_on_timeout_and_shutdown() {
+    // Keep the test bounded even if a guest monopolizes the daemon's only worker.
+    struct NodeGuard(std::process::Child);
+    impl Drop for NodeGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let data_dir = temp_path("management-loop-data");
+    let config_path = temp_path("management-loop.toml");
+    let token_path = temp_path("management-loop-token");
+    let listen: SocketAddr = free_addr().parse().unwrap();
+    std::fs::write(&token_path, "top-secret").unwrap();
+    std::fs::write(
+        &config_path,
+        format!(
+            "[management]\nlisten = \"{listen}\"\ntoken_file = \"{}\"\nrequest_timeout_secs = 1\n",
+            token_path.display(),
+        ),
+    )
+    .unwrap();
+    let mut node = NodeGuard(
+        Command::new(nx_bin())
+            .args(["serve", "--shutdown-timeout", "100ms"])
+            .arg("--config")
+            .arg(&config_path)
+            .arg("--datastore-path")
+            .arg(&data_dir)
+            .env("TOKIO_WORKER_THREADS", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_http(listen, Some("Bearer top-secret"));
+
+    let mut run_path = String::new();
+    for loop_in_start_function in [false, true] {
+        let mut wasm = minimal_run_module();
+        wasm.truncate(wasm.len() - 6); // Replace the original code section.
+        if loop_in_start_function {
+            wasm.extend([8, 1, 0]); // Start section: invoke function 0 during instantiation.
+        }
+        wasm.extend([10, 9, 1, 7, 0, 3, 0x40, 0x0c, 0, 0x0b, 0x0b]);
+        let registered = management_request(
+            listen,
+            "POST",
+            "/api/v1/modules",
+            Some("Bearer top-secret"),
+            Some("application/wasm"),
+            &wasm,
+        );
+        assert!(
+            registered.starts_with("HTTP/1.1 201 Created"),
+            "{registered}"
+        );
+        let module: serde_json::Value = serde_json::from_str(response_body(&registered)).unwrap();
+        run_path = format!("/api/v1/modules/{}/runs", module["id"].as_str().unwrap());
+        let response = management_request(
+            listen,
+            "POST",
+            &run_path,
+            Some("Bearer top-secret"),
+            None,
+            &[],
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 504 Gateway Timeout"),
+            "{response}"
+        );
+        assert!(response_body(&response).contains("request_timeout"));
+        let health = management_request(
+            listen,
+            "GET",
+            "/api/v1/health",
+            Some("Bearer top-secret"),
+            None,
+            &[],
+        );
+        assert!(health.starts_with("HTTP/1.1 200 OK"));
+    }
+
+    // Start a cached, looping start function again and stop before its HTTP timeout.
+    let mut stream = TcpStream::connect(listen).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+        .unwrap();
+    write!(stream, "POST {run_path} HTTP/1.1\r\nHost: {listen}\r\nAuthorization: Bearer top-secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    send_signal(node.0.id(), "TERM");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if let Some(status) = node.0.try_wait().unwrap() {
+            // A bounded forced shutdown reports an error; graceful completion is also valid.
+            assert!(
+                matches!(status.code(), Some(0 | 1)),
+                "unexpected exit: {status}"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "daemon did not stop after cancelling the guest"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
+    assert!(
+        !response.contains("504 Gateway Timeout"),
+        "shutdown waited for the longer HTTP timeout instead of cancelling the guest"
+    );
     assert!(TcpStream::connect(listen).is_err());
 }
 

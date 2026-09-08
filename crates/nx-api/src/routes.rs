@@ -7,15 +7,18 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use nx_core::control::MAX_CONTROL_PAGE_SIZE;
 use nx_core::{ControlError, ModuleInfo, PeerInfo, SharedRuntimeControl};
 use serde::{Deserialize, Serialize};
 
 use crate::{error_response, payload_too_large_response};
 
 const DEFAULT_PAGE_SIZE: usize = 50;
-const MAX_PAGE_SIZE: usize = 100;
+const MAX_PAGE_SIZE: usize = MAX_CONTROL_PAGE_SIZE;
 const MAX_KEY_SIZE: usize = 8 * 1024;
 const MAX_RESPONSE_BODY_SIZE: usize = 1024 * 1024;
+// Outside the Base64URL alphabet, and a stable, nonempty HTTP path segment.
+const EMPTY_KEY: &str = "~";
 
 #[derive(Clone)]
 struct ApiState {
@@ -223,11 +226,11 @@ async fn list_peers(
         Err(_) => return invalid_request(),
     };
     match state.control.list_peers(query.cursor, query.limit).await {
-        Ok(page) => Json(PageResponse {
-            items: page.items.into_iter().map(PeerResponse::from).collect(),
-            next_cursor: encode_cursor(page.next_cursor),
-        })
-        .into_response(),
+        Ok(page) => bounded_page(
+            page.items.into_iter().map(PeerResponse::from).collect(),
+            encode_cursor(page.next_cursor),
+            |peer| URL_SAFE_NO_PAD.encode(&peer.address),
+        ),
         Err(error) => control_error_response(error),
     }
 }
@@ -397,6 +400,9 @@ fn decode_key(encoded: Option<&str>, allow_absent: bool) -> Result<Vec<u8>, Inva
     if encoded.is_empty() {
         return Err(InvalidRequest);
     }
+    if encoded == EMPTY_KEY {
+        return Ok(Vec::new());
+    }
     let decoded = URL_SAFE_NO_PAD
         .decode(encoded)
         .map_err(|_| InvalidRequest)?;
@@ -407,33 +413,66 @@ fn decode_key(encoded: Option<&str>, allow_absent: bool) -> Result<Vec<u8>, Inva
 }
 
 fn bounded_key_page(items: Vec<Vec<u8>>, next_cursor: Option<Vec<u8>>) -> Response {
-    if items
-        .iter()
-        .any(|key| key.is_empty() || key.len() > MAX_KEY_SIZE)
-    {
+    if items.iter().any(|key| key.len() > MAX_KEY_SIZE) {
         return internal_error();
     }
-    let mut encoded_items = items
-        .into_iter()
-        .map(|key| URL_SAFE_NO_PAD.encode(key))
-        .collect::<Vec<_>>();
-    let mut next_cursor = encode_cursor(next_cursor);
+    bounded_page(
+        items.into_iter().map(|key| encode_key(&key)).collect(),
+        next_cursor.map(|key| encode_key(&key)),
+        String::clone,
+    )
+}
+
+fn encode_key(key: &[u8]) -> String {
+    if key.is_empty() {
+        EMPTY_KEY.to_string()
+    } else {
+        URL_SAFE_NO_PAD.encode(key)
+    }
+}
+
+/// Bound the serialized bytes too, including JSON escaping and the next cursor.
+fn bounded_page<T: Serialize>(
+    items: Vec<T>,
+    next_cursor: Option<String>,
+    cursor_for: impl Fn(&T) -> String,
+) -> Response {
+    let mut page = PageResponse { items, next_cursor };
 
     loop {
-        let page = PageResponse {
-            items: encoded_items.clone(),
-            next_cursor: next_cursor.clone(),
-        };
-        match serde_json::to_vec(&page) {
-            Ok(bytes) if bytes.len() <= MAX_RESPONSE_BODY_SIZE => {
-                return Json(page).into_response();
-            }
-            Ok(_) if !encoded_items.is_empty() => {
-                encoded_items.pop();
-                next_cursor = encoded_items.last().cloned();
-            }
-            Ok(_) | Err(_) => return internal_error(),
+        let mut body = LimitedJsonBody::default();
+        if serde_json::to_writer(&mut body, &page).is_ok() {
+            return ([(header::CONTENT_TYPE, "application/json")], body.bytes).into_response();
         }
+        // Never skip an oversized single item or falsely report an empty final page.
+        if !body.exceeded || page.items.len() <= 1 {
+            return internal_error();
+        }
+        page.items.pop();
+        page.next_cursor = page.items.last().map(&cursor_for);
+    }
+}
+
+#[derive(Default)]
+struct LimitedJsonBody {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+impl std::io::Write for LimitedJsonBody {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > MAX_RESPONSE_BODY_SIZE - self.bytes.len() {
+            self.exceeded = true;
+            return Err(std::io::Error::other(
+                "JSON response exceeds the body limit",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -458,7 +497,7 @@ fn is_module_id_bytes(id: &[u8]) -> bool {
 
 fn control_error_response(error: ControlError) -> Response {
     match error {
-        ControlError::InvalidCursor => invalid_request(),
+        ControlError::InvalidCursor | ControlError::InvalidLimit => invalid_request(),
         ControlError::ModuleNotFound => {
             error_response(StatusCode::NOT_FOUND, "not_found", "module not found")
         }
@@ -522,6 +561,7 @@ mod tests {
     struct TestControl {
         modules: Mutex<BTreeMap<String, ModuleInfo>>,
         ready: AtomicBool,
+        peers: Option<Vec<PeerInfo>>,
     }
 
     impl TestControl {
@@ -574,20 +614,25 @@ mod tests {
                 .map(String::from_utf8)
                 .transpose()
                 .map_err(|_| ControlError::InvalidCursor)?;
-            let mut items = [
-                PeerInfo {
-                    address: "127.0.0.1:9001".to_string(),
-                    node_id: "node-a".to_string(),
-                },
-                PeerInfo {
-                    address: "127.0.0.1:9002".to_string(),
-                    node_id: "node-b".to_string(),
-                },
-            ]
-            .into_iter()
-            .filter(|peer| cursor.as_ref().is_none_or(|cursor| &peer.address > cursor))
-            .take(limit + 1)
-            .collect::<Vec<_>>();
+            let mut items = self
+                .peers
+                .clone()
+                .unwrap_or_else(|| {
+                    vec![
+                        PeerInfo {
+                            address: "127.0.0.1:9001".to_string(),
+                            node_id: "node-a".to_string(),
+                        },
+                        PeerInfo {
+                            address: "127.0.0.1:9002".to_string(),
+                            node_id: "node-b".to_string(),
+                        },
+                    ]
+                })
+                .into_iter()
+                .filter(|peer| cursor.as_ref().is_none_or(|cursor| &peer.address > cursor))
+                .take(limit + 1)
+                .collect::<Vec<_>>();
             let has_more = items.len() > limit;
             items.truncate(limit);
             let next_cursor = has_more.then(|| items.last().unwrap().address.as_bytes().to_vec());
@@ -966,6 +1011,58 @@ mod tests {
         .await;
         assert_eq!(wrong_method.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(json(wrong_method).await["error"]["code"], "invalid_request");
+    }
+
+    #[tokio::test]
+    async fn peer_pages_bound_escaped_json_and_preserve_pagination() {
+        let control = Arc::new(TestControl {
+            peers: Some(
+                (1..=3)
+                    .map(|index| PeerInfo {
+                        address: format!("127.0.0.1:900{index}"),
+                        // JSON escapes each control character to six bytes.
+                        node_id: "\u{0001}".repeat(100_000),
+                    })
+                    .collect(),
+            ),
+            ..TestControl::default()
+        });
+        let mut uri = "/api/v1/peers?limit=3".to_string();
+        for index in 1..=3 {
+            let response = call(app(control.clone()), Method::GET, &uri, None, Body::empty()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(bytes.len() <= MAX_RESPONSE_BODY_SIZE);
+            let page: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(page["items"].as_array().unwrap().len(), 1);
+            assert_eq!(page["items"][0]["address"], format!("127.0.0.1:900{index}"));
+            if index < 3 {
+                uri = format!(
+                    "/api/v1/peers?limit=3&cursor={}",
+                    page["next_cursor"].as_str().unwrap()
+                );
+            } else {
+                assert!(page["next_cursor"].is_null());
+            }
+        }
+
+        let control = Arc::new(TestControl {
+            peers: Some(vec![PeerInfo {
+                address: "127.0.0.1:9001".to_string(),
+                node_id: "a".repeat(MAX_RESPONSE_BODY_SIZE + 1),
+            }]),
+            ..TestControl::default()
+        });
+        let response = call(
+            app(control),
+            Method::GET,
+            "/api/v1/peers?limit=1",
+            None,
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(json(response).await["error"]["code"], "internal_error");
     }
 
     #[tokio::test]

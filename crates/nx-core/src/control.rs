@@ -12,6 +12,7 @@ use crate::sync_manager::SyncHandle;
 const RESERVED_PREFIX: &[u8] = b"__nx/";
 const MODULE_DATA_PREFIX: &[u8] = b"__nx/modules/data/";
 const MODULE_META_PREFIX: &[u8] = b"__nx/modules/meta/";
+pub const MAX_CONTROL_PAGE_SIZE: usize = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleInfo {
@@ -40,6 +41,7 @@ pub struct ControlPage<T> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlError {
     InvalidCursor,
+    InvalidLimit,
     ModuleNotFound,
     KeyNotFound,
     InvalidModule(String),
@@ -52,6 +54,10 @@ impl fmt::Display for ControlError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidCursor => formatter.write_str("invalid cursor"),
+            Self::InvalidLimit => write!(
+                formatter,
+                "page limit must be between 1 and {MAX_CONTROL_PAGE_SIZE}"
+            ),
             Self::ModuleNotFound => formatter.write_str("module not found"),
             Self::KeyNotFound => formatter.write_str("key not found"),
             Self::InvalidModule(error) => write!(formatter, "invalid module: {error}"),
@@ -66,6 +72,7 @@ impl fmt::Display for ControlError {
 
 impl Error for ControlError {}
 
+/// Collection methods require a limit between 1 and [`MAX_CONTROL_PAGE_SIZE`].
 #[async_trait]
 pub trait RuntimeIntrospection: Send + Sync {
     async fn list_modules(
@@ -157,6 +164,7 @@ impl RuntimeIntrospection for RuntimeControlHandle {
         cursor: Option<Vec<u8>>,
         limit: usize,
     ) -> Result<ControlPage<PeerInfo>, ControlError> {
+        validate_page_limit(limit)?;
         let cursor = cursor
             .map(String::from_utf8)
             .transpose()
@@ -194,6 +202,7 @@ impl RuntimeIntrospection for RuntimeControlHandle {
         cursor: Option<Vec<u8>>,
         limit: usize,
     ) -> Result<ControlPage<Vec<u8>>, ControlError> {
+        validate_page_limit(limit)?;
         if cursor.as_ref().is_some_and(|cursor| {
             cursor.starts_with(RESERVED_PREFIX)
                 || (!prefix.is_empty() && !cursor.starts_with(&prefix))
@@ -324,6 +333,7 @@ impl ModuleRegistry {
         cursor: Option<&[u8]>,
         limit: usize,
     ) -> Result<ControlPage<ModuleInfo>, ControlError> {
+        validate_page_limit(limit)?;
         let start_after = cursor.map(|cursor| module_key(MODULE_META_PREFIX, cursor));
         let rows = self
             .store
@@ -408,6 +418,13 @@ fn storage_error(error: nx_store::StoreError) -> ControlError {
     ControlError::Storage(error.to_string())
 }
 
+fn validate_page_limit(limit: usize) -> Result<(), ControlError> {
+    if !(1..=MAX_CONTROL_PAGE_SIZE).contains(&limit) {
+        return Err(ControlError::InvalidLimit);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,6 +485,61 @@ mod tests {
 
         assert!(registry.info(&registered.module.id).unwrap().is_none());
         assert!(registry.bytes(&registered.module.id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn collection_limits_are_validated_by_the_shared_control_interface() {
+        let directory = tempdir().unwrap();
+        let runtime = Runtime::new(runtime_config(&directory)).unwrap();
+        let control = runtime.control_handle();
+
+        for populated in [false, true] {
+            if populated {
+                control.register_module(minimal_run_module()).await.unwrap();
+                control.store.set(b"app:key", b"value").unwrap();
+            }
+            for limit in [0, MAX_CONTROL_PAGE_SIZE + 1, usize::MAX] {
+                assert_eq!(
+                    control.list_modules(None, limit).await,
+                    Err(ControlError::InvalidLimit)
+                );
+                assert_eq!(
+                    control.list_keys(Vec::new(), None, limit).await,
+                    Err(ControlError::InvalidLimit)
+                );
+                assert_eq!(
+                    control.list_peers(None, limit).await,
+                    Err(ControlError::InvalidLimit)
+                );
+            }
+            for limit in [1, MAX_CONTROL_PAGE_SIZE] {
+                assert!(control.list_modules(None, limit).await.is_ok());
+                assert!(control.list_keys(Vec::new(), None, limit).await.is_ok());
+                assert!(control.list_peers(None, limit).await.is_ok());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_keys_can_be_read_and_used_as_exclusive_cursors() {
+        let directory = tempdir().unwrap();
+        let runtime = Runtime::new(runtime_config(&directory)).unwrap();
+        let control = runtime.control_handle();
+        control.store.set(b"", b"empty-key-value").unwrap();
+        control.store.set(b"app:key", b"value").unwrap();
+        let first = control.list_keys(Vec::new(), None, 1).await.unwrap();
+        assert_eq!(first.items, vec![Vec::<u8>::new()]);
+        assert_eq!(first.next_cursor, Some(Vec::new()));
+        let next = control
+            .list_keys(Vec::new(), first.next_cursor, 1)
+            .await
+            .unwrap();
+        assert_eq!(next.items, vec![b"app:key".to_vec()]);
+        assert_eq!(next.next_cursor, None);
+        assert_eq!(
+            control.get_value(Vec::new()).await.unwrap(),
+            b"empty-key-value"
+        );
     }
 
     #[tokio::test]

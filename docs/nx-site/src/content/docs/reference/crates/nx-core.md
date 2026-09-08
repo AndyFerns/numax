@@ -118,6 +118,19 @@ namespace, derives stable IDs from the BLAKE3 digest, and restores them when the
 runtime reopens the same datastore. Reserved entries are never exposed by
 datastore introspection.
 
+Collection methods on `RuntimeIntrospection` require `limit` between 1 and
+`nx_core::control::MAX_CONTROL_PAGE_SIZE` (100), returning
+`ControlError::InvalidLimit` outside that range. This validation also applies
+to callers that use the Rust interface directly. Empty binary keys are valid,
+and `Some(Vec::new())` is an exclusive cursor after the empty key.
+
+The executor enables Wasmtime epoch interruption. A runtime-owned ticker
+advances the engine epoch every 10 ms on a dedicated thread, independently of
+Tokio workers. Guest code yields at epoch deadlines, including during WASM
+instantiation, so cancellation can drop an in-flight execution. The ticker
+stops when the last executor handle is dropped. Epochs do not interrupt
+synchronous native host calls or compilation.
+
 ### NodeId persistence
 
 On first start with sync enabled, `load_or_create_node_id` generates a `NodeId` and stores

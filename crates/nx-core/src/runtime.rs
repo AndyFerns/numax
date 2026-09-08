@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 use tokio::time::Instant;
 use wasmtime::{Engine, Linker, Module, Store, StoreLimitsBuilder};
@@ -21,6 +21,43 @@ use crate::sync_manager::{SyncHandle, SyncManager};
 
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const NODE_ID_STORE_KEY: &[u8] = b"__nx/runtime/node_id";
+const WASM_EPOCH_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Advance epochs independently of Tokio: a guest may occupy its only worker.
+struct EpochTicker {
+    stop: Option<mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl EpochTicker {
+    fn start(engine: Engine) -> Result<Self> {
+        let (stop, receiver) = mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("nx-wasm-epochs".to_string())
+            .spawn(move || {
+                while matches!(
+                    receiver.recv_timeout(WASM_EPOCH_INTERVAL),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    engine.increment_epoch();
+                }
+            })?;
+        Ok(Self {
+            stop: Some(stop),
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for EpochTicker {
+    fn drop(&mut self) {
+        // Disconnecting wakes the ticker immediately, including on startup rollback.
+        self.stop.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownSignal {
@@ -77,6 +114,7 @@ pub struct HostState {
 
 pub(crate) struct RuntimeExecutor {
     engine: Engine,
+    _epoch_ticker: EpochTicker,
     linker: Linker<HostState>,
     enable_wasi: bool,
     max_memory_bytes: Option<u64>,
@@ -103,6 +141,7 @@ impl Runtime {
         // Engine: async support is required so wasmtime can yield across host calls
         let mut wasm_cfg = wasmtime::Config::new();
         wasm_cfg.wasm_backtrace_details(wasmtime::WasmBacktraceDetails::Enable);
+        wasm_cfg.epoch_interruption(true);
 
         let engine = Engine::new(&wasm_cfg)?;
         let mut linker: Linker<HostState> = Linker::new(&engine);
@@ -161,6 +200,7 @@ impl Runtime {
         };
 
         let executor = Arc::new(RuntimeExecutor {
+            _epoch_ticker: EpochTicker::start(engine.clone())?,
             engine,
             linker,
             enable_wasi: config.enable_wasi,
@@ -449,6 +489,10 @@ impl RuntimeExecutor {
         };
 
         let mut store = Store::new(&self.engine, host_state);
+        // Apply before instantiation, whose start function can also loop forever.
+        // Yielding makes dropping the invocation future actually cancel the guest.
+        store.set_epoch_deadline(1);
+        store.epoch_deadline_async_yield_and_update(1);
 
         // Register the limiter so wasmtime enforces memory_size on every
         store.limiter(|state| &mut state.limits);
@@ -607,6 +651,7 @@ async fn wait_for_shutdown_signal() -> ShutdownSignal {
         }
     };
 
+    tracing::debug!("shutdown signal handlers installed");
     tokio::select! {
         _ = sigint.recv() => ShutdownSignal::Interrupt,
         _ = sigterm.recv() => ShutdownSignal::Terminate,

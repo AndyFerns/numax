@@ -126,6 +126,12 @@ PREFIX=$(printf 'count' | base64 | tr '+/' '-_' | tr -d '=\n')
 curl -fsS -G -H "$AUTH" --data-urlencode "prefix=$PREFIX" "$API/keys" | jq
 ```
 
+The empty binary key is represented by `~`: read it with `GET /api/v1/keys/~`.
+This marker also appears in `items`, `X-Numax-Key`, and `next_cursor` when
+appropriate. Pass it unchanged as `cursor=~` to continue after the empty key.
+Nonempty keys retain their unpadded Base64URL encoding. Omitting `prefix`, or
+using `prefix=~`, lists all application keys.
+
 The counter key is `counter`, whose Base64URL form is `Y291bnRlcg`. Its value
 is returned as raw `application/octet-stream` bytes:
 
@@ -177,6 +183,15 @@ curl -i -H "$AUTH" "$API/unknown"
 All failures use `{"error":{"code":"...","message":"..."}}`. Uploads are
 limited to 16 MiB, responses to 1 MiB, pages to 100 items, routed requests to
 the configured timeout, and concurrent work to 64 requests.
+
+Peer pages can contain fewer items to respect the response limit; follow
+`next_cursor` until it is null. A peer whose identity cannot fit by itself
+returns `500 internal_error` rather than an oversized response.
+
+Running WASM yields periodically, including during its start function, so
+request timeouts and shutdown can cancel a guest that loops indefinitely.
+Effects already produced by the guest are not rolled back; do not automatically
+retry a run after a timeout or lost connection.
 
 ## Run the repeatable smoke script
 

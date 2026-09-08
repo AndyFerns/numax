@@ -9,7 +9,7 @@ use anyhow::{Result, anyhow, bail};
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -185,6 +185,8 @@ impl ManagementServer {
         let concurrency =
             ConcurrencyState(Arc::new(Semaphore::new(config.concurrent_request_limit)));
         let router = router
+            // Limited below is authoritative for both fixed and chunked bodies.
+            .layer(DefaultBodyLimit::disable())
             .layer(middleware::from_fn_with_state(
                 request_body_limit,
                 enforce_request_body_limit,
@@ -433,6 +435,8 @@ mod tests {
     use super::*;
     use axum::body::Bytes;
     use axum::routing::{get, post};
+    use nx_core::runtime::{Runtime, RuntimeConfig};
+    use nx_core::{RuntimeIntrospection, RuntimeManagement};
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::Notify;
@@ -641,6 +645,129 @@ mod tests {
             .unwrap();
 
         assert!(response.is_empty());
+        server.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wasm_uploads_honor_the_contract_limit_for_fixed_and_chunked_bodies() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(RuntimeConfig {
+            datastore_path: directory.path().to_path_buf(),
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        let control = runtime.control_handle();
+        let config = ManagementConfig::new("127.0.0.1:0", "top-secret", false)
+            .unwrap()
+            .with_request_timeout(Duration::from_secs(30))
+            .unwrap();
+        let server = ManagementServer::start(config, Arc::new(control.clone()))
+            .await
+            .unwrap();
+        let addr = server.local_addr();
+
+        for size in [
+            2 * 1024 * 1024 + 1,
+            MAX_MANAGEMENT_REQUEST_BODY_SIZE,
+            MAX_MANAGEMENT_REQUEST_BODY_SIZE + 1,
+        ] {
+            // A valid empty WASM module with a custom section padded to exactly size.
+            let mut wasm = b"\0asm\x01\0\0\0\0".to_vec();
+            let mut payload_len = size - wasm.len() - 1;
+            loop {
+                let mut len = payload_len;
+                let mut encoded = Vec::new();
+                loop {
+                    let byte = (len & 127) as u8;
+                    len >>= 7;
+                    encoded.push(byte | if len > 0 { 128 } else { 0 });
+                    if len == 0 {
+                        break;
+                    }
+                }
+                if wasm.len() + encoded.len() + payload_len == size {
+                    wasm.extend(encoded);
+                    wasm.resize(size, 0);
+                    break;
+                }
+                payload_len = size - wasm.len() - encoded.len();
+            }
+            for chunked in [false, true] {
+                let framing = if chunked {
+                    "Transfer-Encoding: chunked\r\n".to_string()
+                } else {
+                    format!("Content-Length: {size}\r\n")
+                };
+                let mut upload = format!("POST /api/v1/modules HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer top-secret\r\nContent-Type: application/wasm\r\n{framing}Connection: close\r\n\r\n").into_bytes();
+                if chunked {
+                    upload.extend(format!("{size:x}\r\n").as_bytes());
+                    upload.extend(&wasm);
+                    upload.extend(b"\r\n0\r\n\r\n");
+                } else if size <= MAX_MANAGEMENT_REQUEST_BODY_SIZE {
+                    upload.extend(&wasm);
+                }
+                let response = raw_request(addr, &upload).await;
+                if size > MAX_MANAGEMENT_REQUEST_BODY_SIZE {
+                    assert_payload_too_large(&response);
+                } else {
+                    let status = if chunked { "200 OK" } else { "201 Created" };
+                    assert!(
+                        response.starts_with(&format!("HTTP/1.1 {status}")),
+                        "{response}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            control.list_modules(None, 100).await.unwrap().items.len(),
+            2
+        );
+        server.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn guest_written_empty_key_roundtrips_through_http_and_pagination() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(RuntimeConfig {
+            datastore_path: directory.path().to_path_buf(),
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        let control = runtime.control_handle();
+        let wasm = wat::parse_str(
+            r#"(module
+            (import "nx" "db_set" (func $set (param i32 i32 i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 0) "avalue")
+            (func (export "run")
+                (drop (call $set (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 5)))
+                (drop (call $set (i32.const 0) (i32.const 1) (i32.const 1) (i32.const 5)))))"#,
+        )
+        .unwrap();
+        let module = control.register_module(wasm).await.unwrap();
+        control.run_module(module.module.id).await.unwrap();
+        let server = ManagementServer::start(
+            ManagementConfig::new("127.0.0.1:0", "top-secret", false).unwrap(),
+            Arc::new(control),
+        )
+        .await
+        .unwrap();
+        let addr = server.local_addr();
+        let first = request(addr, "/api/v1/keys?limit=1", Some("Bearer top-secret")).await;
+        assert!(first.starts_with("HTTP/1.1 200 OK"));
+        assert!(first.ends_with(r#"{"items":["~"],"next_cursor":"~"}"#));
+        let next = request(
+            addr,
+            "/api/v1/keys?limit=1&cursor=~",
+            Some("Bearer top-secret"),
+        )
+        .await;
+        assert!(next.starts_with("HTTP/1.1 200 OK"));
+        assert!(next.ends_with(r#"{"items":["YQ"],"next_cursor":null}"#));
+        let value = request(addr, "/api/v1/keys/~", Some("Bearer top-secret")).await;
+        assert!(value.starts_with("HTTP/1.1 200 OK"));
+        assert!(value.contains("x-numax-key: ~\r\n"));
+        assert!(value.ends_with("\r\n\r\nvalue"));
         server.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 
