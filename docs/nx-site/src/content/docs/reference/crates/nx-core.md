@@ -14,6 +14,8 @@ Everything below that boundary lives here or in the crates it composes.
 | Responsibility | Where |
 |---|---|
 | WASM module loading, compilation, caching | `runtime.rs` - `Runtime::run_module`, `compile_or_get_cached_module` |
+| Shared runtime inspection and management operations | `control.rs` - `RuntimeIntrospection`, `RuntimeManagement`, `RuntimeControlHandle` |
+| Persistent local module registry | `control.rs` - `ModuleRegistry` |
 | Host API surface (all `nx` namespace imports) | `host_api/` - one file per API group |
 | Lifecycle: start sync, run module, settle, serve, shutdown | `runtime.rs` - `Runtime` |
 | Sync orchestration, in-memory CRDT registry and op-log | `sync_manager/manager.rs` - `SyncManager` |
@@ -35,12 +37,11 @@ in order, then shuts it down.
 
 ```rust
 pub struct Runtime {
-    engine:               Engine,          // wasmtime engine, shared across runs
-    linker:               Linker<HostState>, // all host API functions registered here
+    executor:             Arc<RuntimeExecutor>, // engine, linker and module cache
     config:               RuntimeConfig,
     store:                Arc<NxStore>,    // shared with every HostState and the sync manager
     metrics:              Arc<RuntimeMetrics>,
-    module_cache:         Mutex<HashMap<[u8; 32], Module>>, // blake3 keyed
+    module_registry:      ModuleRegistry,  // persistent local WASM artifacts
     sync_manager:         Option<SyncManager>,
     sync_handle:          Option<SyncHandle>, // cheap clone, passed to every HostState
     observability_server: Option<ObservabilityServer>,
@@ -99,6 +100,7 @@ Runtime::new(config)
 | `start_sync()` | Calls `SyncManager::start()`, starts TCP listener + dial loop. No-op if sync disabled |
 | `wait_before_run(dur)` | Repeatedly reconnects configured peers until the deadline. No-op if sync disabled |
 | `run_module(bytes)` | Compiles or retrieves cached module, builds `HostState`, instantiates, calls `run()` or `_start()` |
+| `control_handle()` | Returns the shared introspection and management handle used by transport adapters |
 | `settle_for(dur)` | Sleeps for `dur`, keeping sync alive. No-op if sync disabled |
 | `serve()` | Blocks until OS signal (SIGINT/SIGTERM/SIGHUP on Unix, Ctrl+C on Windows). No-op if sync disabled |
 | `wait_until_shutdown()` | Blocks until an OS shutdown signal regardless of whether sync is enabled; used by daemon processes |
@@ -109,6 +111,12 @@ Runtime::new(config)
 Modules are compiled once and cached in a `Mutex<HashMap<[u8; 32], Module>>`, keyed by
 the blake3 hash of the raw bytes. Repeated calls to `run_module` with the same bytes skip
 compilation entirely. The cache lives for the lifetime of the `Runtime`.
+
+Registered Management API modules are separate persistent local artifacts. The
+registry stores their bytes and metadata under the reserved `__nx/modules/`
+namespace, derives stable IDs from the BLAKE3 digest, and restores them when the
+runtime reopens the same datastore. Reserved entries are never exposed by
+datastore introspection.
 
 ### NodeId persistence
 

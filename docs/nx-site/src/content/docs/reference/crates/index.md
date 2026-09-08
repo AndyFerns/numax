@@ -154,14 +154,15 @@ Compiles to `wasm32-unknown-unknown`. Has no internal workspace dependencies and
 authentication, body/header/request limits, concurrency admission, and bounded
 connection draining.
 
-**Does not own:** runtime operations or endpoint semantics. Those will be
-provided through the shared control interfaces after the OpenAPI contract is
-defined.
+**Does not own:** runtime operations. Endpoint handlers adapt the shared
+`RuntimeIntrospection` and `RuntimeManagement` interfaces from `nx-core` to the
+reviewed OpenAPI contract.
 
 **Key files:**
-- `src/lib.rs` - `ManagementConfig` and `ManagementServer`
+- `src/lib.rs` - `ManagementConfig`, transport limits and `ManagementServer`
+- `src/routes.rs` - authenticated `/api/v1/*` handlers and HTTP error mapping
 
-**External dependencies:** `axum`, `http-body-util`, `hyper`, `hyper-util`, `serde`, `tower`, `tokio`, `subtle`, `tracing`
+**External dependencies:** `axum`, `base64`, `http-body-util`, `hyper`, `hyper-util`, `nx-core`, `serde`, `serde_json`, `tower`, `tokio`, `subtle`, `tracing`
 
 ---
 
@@ -170,17 +171,19 @@ defined.
 ```
 nx-cli ──────────────────────────────────── bin: nx
   │
-      ├── nx-core ──────────────────────────── runtime, host API, sync manager
-      │     │
-      │     ├── nx-store ─────────────────────  sled KV store
-      │     │
-      │     ├── nx-sync ──────────────────────  CRDT types, op types, pure logic
-      │     │
-      │     └── nx-net ───────────────────────  TCP, TLS, gossip, anti-entropy
-      │           │
-      │           └── nx-sync
-      │
-      └── nx-api ─────────────────────────────  Management API transport
+  ├── nx-api ─────────────────────────────  Management API adapter
+  │     │
+  │     └── nx-core
+  │
+  └── nx-core ──────────────────────────── runtime, host API, control, sync manager
+        │
+        ├── nx-store ─────────────────────  sled KV store
+        │
+        ├── nx-sync ──────────────────────  CRDT types, op types, pure logic
+        │
+        └── nx-net ───────────────────────  TCP, TLS, gossip, anti-entropy
+              │
+              └── nx-sync
 
 nx-sdk ───────────────────────────────────  guest SDK (wasm32, no internal deps)
 ```

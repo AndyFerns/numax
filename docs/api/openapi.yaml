@@ -432,6 +432,7 @@ components:
       description: Unpadded RFC 4648 Base64URL encoding of a binary key up to 8 KiB.
       example: YXBwOnVzZXI6NDI
     ModulePage:
+      unevaluatedProperties: false
       allOf:
         - $ref: "#/components/schemas/Page"
         - type: object
@@ -458,6 +459,7 @@ components:
           description: Node identity reported by the connected peer.
           example: node-a
     PeerPage:
+      unevaluatedProperties: false
       allOf:
         - $ref: "#/components/schemas/Page"
         - type: object
@@ -469,6 +471,7 @@ components:
               items:
                 $ref: "#/components/schemas/Peer"
     KeyPage:
+      unevaluatedProperties: false
       allOf:
         - $ref: "#/components/schemas/Page"
         - type: object
@@ -481,7 +484,6 @@ components:
                 $ref: "#/components/schemas/Base64UrlKey"
     Page:
       type: object
-      additionalProperties: false
       required: [next_cursor]
       properties:
         next_cursor:

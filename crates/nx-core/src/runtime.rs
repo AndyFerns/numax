@@ -11,6 +11,7 @@ use wasmtime_wasi::{WasiCtx, p1};
 use nx_store::Store as NxStore;
 use nx_sync::NodeId;
 
+use crate::control::{ModuleRegistry, RuntimeControlHandle};
 use crate::host_api;
 use crate::observability::{
     ObservabilityConfig, ObservabilityServer, RuntimeMetrics, start_server,
@@ -74,13 +75,23 @@ pub struct HostState {
     pub limits: wasmtime::StoreLimits,
 }
 
-pub struct Runtime {
+pub(crate) struct RuntimeExecutor {
     engine: Engine,
     linker: Linker<HostState>,
+    enable_wasi: bool,
+    max_memory_bytes: Option<u64>,
+    store: Arc<NxStore>,
+    metrics: Arc<RuntimeMetrics>,
+    sync_handle: Option<SyncHandle>,
+    module_cache: Mutex<HashMap<[u8; 32], Module>>,
+}
+
+pub struct Runtime {
+    executor: Arc<RuntimeExecutor>,
     config: RuntimeConfig,
     store: Arc<NxStore>,
     metrics: Arc<RuntimeMetrics>,
-    module_cache: Mutex<HashMap<[u8; 32], Module>>,
+    module_registry: ModuleRegistry,
 
     sync_manager: Option<SyncManager>,
     sync_handle: Option<SyncHandle>,
@@ -149,13 +160,24 @@ impl Runtime {
             (None, None)
         };
 
-        Ok(Self {
+        let executor = Arc::new(RuntimeExecutor {
             engine,
             linker,
+            enable_wasi: config.enable_wasi,
+            max_memory_bytes: config.max_memory_bytes,
+            store: Arc::clone(&store),
+            metrics: Arc::clone(&metrics),
+            sync_handle: sync_handle.clone(),
+            module_cache: Mutex::new(HashMap::new()),
+        });
+        let module_registry = ModuleRegistry::new(Arc::clone(&store));
+
+        Ok(Self {
+            executor,
             config,
             store,
             metrics,
-            module_cache: Mutex::new(HashMap::new()),
+            module_registry,
             sync_manager,
             sync_handle,
             observability_server: None,
@@ -240,6 +262,17 @@ impl Runtime {
     /// Return true when this runtime owns an active sync manager.
     pub fn sync_enabled(&self) -> bool {
         self.sync_handle.is_some()
+    }
+
+    /// Return the shared control-plane handle used by in-process management adapters.
+    pub fn control_handle(&self) -> RuntimeControlHandle {
+        RuntimeControlHandle::new(
+            Arc::clone(&self.executor),
+            self.module_registry.clone(),
+            Arc::clone(&self.store),
+            Arc::clone(&self.metrics),
+            self.sync_handle.clone(),
+        )
     }
 
     /// Return the current value of a GCounter, if sync is enabled.
@@ -361,23 +394,41 @@ impl Runtime {
     }
 
     pub async fn run_module(&self, wasm_bytes: &[u8]) -> Result<()> {
+        self.executor
+            .run_module(wasm_bytes, &self.config.module_id)
+            .await
+    }
+
+    #[cfg(test)]
+    fn cached_module_count(&self) -> usize {
+        self.executor.cached_module_count()
+    }
+}
+
+impl RuntimeExecutor {
+    pub(crate) fn validate_module(&self, wasm_bytes: &[u8]) -> Result<()> {
+        Module::validate(&self.engine, wasm_bytes)
+            .map_err(|error| anyhow!("Invalid module (compile/validate): {error}"))
+    }
+
+    pub(crate) async fn run_module(&self, wasm_bytes: &[u8], module_id: &str) -> Result<()> {
         let module_hash = blake3::hash(wasm_bytes);
         let module_key = module_hash.to_hex().to_string();
 
         // handle shared to the DB
         let store_db = Arc::clone(&self.store);
-        let module_id: Arc<str> = Arc::from(self.config.module_id.as_str());
+        let module_id: Arc<str> = Arc::from(module_id);
 
         // Build per-invocation resource limits. max_memory_bytes is cast to usize;
         // on 32-bit hosts values above 4 GiB would truncate silently, but numax targets 64-bit hostswhere usize == u64, so the cast is lossless.
         let mut limits_builder = StoreLimitsBuilder::new();
-        if let Some(max_bytes) = self.config.max_memory_bytes {
+        if let Some(max_bytes) = self.max_memory_bytes {
             limits_builder = limits_builder.memory_size(max_bytes as usize);
         }
         let limits = limits_builder.build();
 
         // Builds the host state for this run
-        let host_state = if self.config.enable_wasi {
+        let host_state = if self.enable_wasi {
             let wasi = WasiCtx::builder().inherit_stdio().inherit_args().build_p1();
 
             HostState {
@@ -496,7 +547,7 @@ impl Runtime {
     }
 
     #[cfg(test)]
-    fn cached_module_count(&self) -> usize {
+    pub(crate) fn cached_module_count(&self) -> usize {
         self.module_cache.lock().unwrap().len()
     }
 }

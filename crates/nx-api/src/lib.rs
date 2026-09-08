@@ -1,3 +1,5 @@
+mod routes;
+
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -23,6 +25,8 @@ use tokio::sync::{Semaphore, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 use tower::Service;
+
+use nx_core::SharedRuntimeControl;
 
 pub const DEFAULT_MANAGEMENT_LISTEN: &str = "127.0.0.1:9102";
 pub const DEFAULT_MANAGEMENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -165,8 +169,8 @@ pub struct ManagementServer {
 }
 
 impl ManagementServer {
-    pub async fn start(config: ManagementConfig) -> Result<Self> {
-        Self::start_with_router(config, Router::new().fallback(StatusCode::NOT_FOUND)).await
+    pub async fn start(config: ManagementConfig, control: SharedRuntimeControl) -> Result<Self> {
+        Self::start_with_router(config, routes::router(control)).await
     }
 
     async fn start_with_router(config: ManagementConfig, router: Router) -> Result<Self> {
@@ -402,7 +406,7 @@ async fn require_bearer(State(state): State<AuthState>, request: Request, next: 
     next.run(request).await
 }
 
-fn payload_too_large_response() -> Response {
+pub(crate) fn payload_too_large_response() -> Response {
     error_response(
         StatusCode::PAYLOAD_TOO_LARGE,
         "payload_too_large",
@@ -410,7 +414,11 @@ fn payload_too_large_response() -> Response {
     )
 }
 
-fn error_response(status: StatusCode, code: &'static str, message: &'static str) -> Response {
+pub(crate) fn error_response(
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
+) -> Response {
     (
         status,
         Json(ErrorEnvelope {
@@ -482,7 +490,12 @@ mod tests {
     #[tokio::test]
     async fn server_requires_bearer_authentication_and_shuts_down() {
         let config = ManagementConfig::new("127.0.0.1:0", "top-secret", false).unwrap();
-        let server = ManagementServer::start(config).await.unwrap();
+        let server = ManagementServer::start_with_router(
+            config,
+            Router::new().fallback(StatusCode::NOT_FOUND),
+        )
+        .await
+        .unwrap();
         let addr = server.local_addr();
 
         let unauthorized = request(addr, "/api/v1/health", None).await;
@@ -504,7 +517,14 @@ mod tests {
         let addr = occupied.local_addr().unwrap();
         let config = ManagementConfig::new(&addr.to_string(), "top-secret", false).unwrap();
 
-        assert!(ManagementServer::start(config).await.is_err());
+        assert!(
+            ManagementServer::start_with_router(
+                config,
+                Router::new().fallback(StatusCode::NOT_FOUND),
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -600,7 +620,12 @@ mod tests {
             .unwrap()
             .with_concurrent_request_limit(1)
             .unwrap();
-        let server = ManagementServer::start(config).await.unwrap();
+        let server = ManagementServer::start_with_router(
+            config,
+            Router::new().fallback(StatusCode::NOT_FOUND),
+        )
+        .await
+        .unwrap();
         let mut stream = tokio::net::TcpStream::connect(server.local_addr())
             .await
             .unwrap();

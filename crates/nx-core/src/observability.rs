@@ -315,7 +315,7 @@ impl RuntimeMetrics {
         }
     }
 
-    fn is_ready(&self) -> bool {
+    pub(crate) fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Relaxed)
     }
 

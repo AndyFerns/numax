@@ -10,7 +10,7 @@ Finally with `v0.1.4`, Numax returns to shipping major runtime capabilities !!
 The release introduces `nx serve`, a daemon that can start without a WASM
 module and then be managed through an authenticated REST API.
 
-Underneath, `RuntimeIntrospection` and `RuntimeManagement` will provide the
+Underneath, `RuntimeIntrospection` and `RuntimeManagement` provide the
 shared control layer for the CLI, REST API and, later, the dashboard and TUI.
 The OpenAPI contract, authentication, pagination and resource limits are part
 of the feature.

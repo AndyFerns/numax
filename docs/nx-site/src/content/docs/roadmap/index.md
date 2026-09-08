@@ -161,26 +161,26 @@ a partially updated state.
 - [x] Non-loopback exposure requires an explicit opt-in and documented TLS or reverse-proxy protection
 
 **v1 endpoints**:
-- [ ] `POST /api/v1/modules` - register a WASM module
-- [ ] `GET /api/v1/modules` - list registered modules
-- [ ] `GET /api/v1/modules/{id}` - inspect a registered module
-- [ ] `DELETE /api/v1/modules/{id}` - remove a registered module
-- [ ] `POST /api/v1/modules/{id}/runs` - execute a registered module once
-- [ ] `GET /api/v1/peers` - list connected peers
-- [ ] `GET /api/v1/keys?prefix=...` - list keys
-- [ ] `GET /api/v1/keys/{key}` - read a value
-- [ ] `GET /api/v1/health`, `GET /api/v1/ready` (aliases of existing observability endpoints)
+- [x] `POST /api/v1/modules` - register a WASM module
+- [x] `GET /api/v1/modules` - list registered modules
+- [x] `GET /api/v1/modules/{id}` - inspect a registered module
+- [x] `DELETE /api/v1/modules/{id}` - remove a registered module
+- [x] `POST /api/v1/modules/{id}/runs` - execute a registered module once
+- [x] `GET /api/v1/peers` - list connected peers
+- [x] `GET /api/v1/keys?prefix=...` - list keys
+- [x] `GET /api/v1/keys/{key}` - read a value
+- [x] `GET /api/v1/health`, `GET /api/v1/ready` (aliases of existing observability endpoints)
 
 **Module lifecycle**:
-- [ ] Registered modules are local artifacts with stable IDs
-- [ ] Module execution remains one-shot; long-running modules and hot reload are out of scope
+- [x] Registered modules are local artifacts with stable IDs
+- [x] Module execution remains one-shot; long-running modules and hot reload are out of scope
 
 **Internal pattern**:
-- [ ] `RuntimeIntrospection` is the single source of truth for read-only operations used by CLI, REST API, dashboard and TUI
-- [ ] `RuntimeManagement` is the single source of truth for mutating management operations
+- [x] `RuntimeIntrospection` is the single source of truth for read-only operations used by CLI, REST API, dashboard and TUI
+- [x] `RuntimeManagement` is the single source of truth for mutating management operations
 
 **Automation example**:
-- [ ] Reproducible example managing a node through the REST API with `curl` and a shell script
+- [x] Reproducible example managing a node through the REST API with `curl` and a shell script
 
 **Closing criterion**:
 > After starting the daemon, a numax node can be managed exclusively via the authenticated REST API. The documented automation example registers, inspects and runs a module, then verifies node readiness without further CLI commands.

@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -11,6 +12,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 use config::*;
 use nx_api::ManagementServer;
+use nx_core::SharedRuntimeControl;
 use nx_core::runtime::{DEFAULT_SHUTDOWN_TIMEOUT, Runtime, RuntimeConfig};
 use nx_core::sync_manager::{
     DEFAULT_MIGRATION_BATCH_BYTES, DEFAULT_MIGRATION_BATCH_SIZE, MigrationOptions,
@@ -438,7 +440,8 @@ async fn real_main(cli: Cli) -> Result<()> {
                 rt.start_observability().await?;
                 rt.start_sync().await?;
                 if let Some(config) = management_config {
-                    management_server = Some(ManagementServer::start(config).await?);
+                    let control: SharedRuntimeControl = Arc::new(rt.control_handle());
+                    management_server = Some(ManagementServer::start(config, control).await?);
                 }
                 if !has_active_service {
                     tracing::warn!(

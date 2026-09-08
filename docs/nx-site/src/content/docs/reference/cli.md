@@ -287,8 +287,9 @@ nx serve --config numax.toml
 
 The Management API starts on `127.0.0.1:9102` when `[management].token_file` or
 `NX_MANAGEMENT_TOKEN` is configured. It stops accepting requests and drains
-active connections before the runtime shuts down. Until the v1 endpoint
-handlers are implemented, authenticated requests return `404`.
+active connections before the runtime shuts down. Authenticated v1 endpoints
+register and run modules and inspect modules, peers, application keys, health
+and readiness. See the [Management API guide](/numax/guides/management-api/).
 
 If sync, observability and management are all disabled, the process still waits
 for a shutdown signal and logs a warning.

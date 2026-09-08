@@ -10,6 +10,7 @@ heap-profiling = ["dep:dhat"]
 
 [dependencies]
 anyhow = "1"
+async-trait = "0.1"
 blake3 = "1"
 getrandom = "0.4"
 sha2 = "0.11.0"

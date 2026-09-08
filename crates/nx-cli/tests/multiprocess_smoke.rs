@@ -89,6 +89,58 @@ fn wait_for_http(addr: SocketAddr, authorization: Option<&str>) -> String {
     }
 }
 
+#[cfg(unix)]
+fn management_request(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    authorization: Option<&str>,
+    content_type: Option<&str>,
+    body: &[u8],
+) -> String {
+    let mut stream = TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(1))
+        .expect("connect to management API");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+        .unwrap();
+    let authorization = authorization
+        .map(|value| format!("Authorization: {value}\r\n"))
+        .unwrap_or_default();
+    let content_type = content_type
+        .map(|value| format!("Content-Type: {value}\r\n"))
+        .unwrap_or_default();
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{authorization}{content_type}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+    stream.write_all(&request).unwrap();
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    String::from_utf8(response).expect("management response should be UTF-8 in this test")
+}
+
+#[cfg(unix)]
+fn response_body(response: &str) -> &str {
+    response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .expect("HTTP response should contain a header terminator")
+}
+
+#[cfg(unix)]
+fn minimal_run_module() -> Vec<u8> {
+    vec![
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // header
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type: () -> ()
+        0x03, 0x02, 0x01, 0x00, // function section
+        0x07, 0x07, 0x01, 0x03, b'r', b'u', b'n', 0x00, 0x00, // export run
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b, // body
+    ]
+}
+
 fn assert_printed_counter(output: &Output, label: &str, expected: u64) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let needle = format!("{COUNTER_KEY} = {expected}");
@@ -215,7 +267,129 @@ fn serve_starts_authenticated_management_listener_and_stops_it_on_sigterm() {
     let unauthorized = wait_for_http(listen, None);
     assert!(unauthorized.starts_with("HTTP/1.1 401 Unauthorized"));
     let authenticated = wait_for_http(listen, Some("Bearer top-secret"));
-    assert!(authenticated.starts_with("HTTP/1.1 404 Not Found"));
+    assert!(authenticated.starts_with("HTTP/1.1 200 OK"));
+    assert_eq!(response_body(&authenticated), r#"{"status":"healthy"}"#);
+
+    let ready = management_request(
+        listen,
+        "GET",
+        "/api/v1/ready",
+        Some("Bearer top-secret"),
+        None,
+        &[],
+    );
+    assert!(ready.starts_with("HTTP/1.1 200 OK"));
+
+    let peers = management_request(
+        listen,
+        "GET",
+        "/api/v1/peers",
+        Some("Bearer top-secret"),
+        None,
+        &[],
+    );
+    assert!(peers.starts_with("HTTP/1.1 200 OK"));
+    assert_eq!(response_body(&peers), r#"{"items":[],"next_cursor":null}"#);
+
+    let wasm = minimal_run_module();
+    let registered = management_request(
+        listen,
+        "POST",
+        "/api/v1/modules",
+        Some("Bearer top-secret"),
+        Some("application/wasm"),
+        &wasm,
+    );
+    assert!(registered.starts_with("HTTP/1.1 201 Created"));
+    let module: serde_json::Value = serde_json::from_str(response_body(&registered)).unwrap();
+    let module_id = module["id"].as_str().unwrap();
+    assert_eq!(module_id.len(), 64);
+    assert!(registered.contains(&format!("location: /api/v1/modules/{module_id}\r\n")));
+
+    let duplicate = management_request(
+        listen,
+        "POST",
+        "/api/v1/modules",
+        Some("Bearer top-secret"),
+        Some("application/wasm"),
+        &wasm,
+    );
+    assert!(duplicate.starts_with("HTTP/1.1 200 OK"));
+    assert_eq!(response_body(&duplicate), response_body(&registered));
+
+    let modules = management_request(
+        listen,
+        "GET",
+        "/api/v1/modules",
+        Some("Bearer top-secret"),
+        None,
+        &[],
+    );
+    assert!(modules.starts_with("HTTP/1.1 200 OK"));
+    assert!(response_body(&modules).contains(module_id));
+
+    let inspected = management_request(
+        listen,
+        "GET",
+        &format!("/api/v1/modules/{module_id}"),
+        Some("Bearer top-secret"),
+        None,
+        &[],
+    );
+    assert!(inspected.starts_with("HTTP/1.1 200 OK"));
+    assert_eq!(response_body(&inspected), response_body(&registered));
+
+    let run = management_request(
+        listen,
+        "POST",
+        &format!("/api/v1/modules/{module_id}/runs"),
+        Some("Bearer top-secret"),
+        None,
+        &[],
+    );
+    assert!(run.starts_with("HTTP/1.1 204 No Content"));
+
+    let keys = management_request(
+        listen,
+        "GET",
+        "/api/v1/keys",
+        Some("Bearer top-secret"),
+        None,
+        &[],
+    );
+    assert!(keys.starts_with("HTTP/1.1 200 OK"));
+    assert_eq!(response_body(&keys), r#"{"items":[],"next_cursor":null}"#);
+
+    let missing_key = management_request(
+        listen,
+        "GET",
+        "/api/v1/keys/bWlzc2luZw",
+        Some("Bearer top-secret"),
+        None,
+        &[],
+    );
+    assert!(missing_key.starts_with("HTTP/1.1 404 Not Found"));
+
+    for _ in 0..2 {
+        let deleted = management_request(
+            listen,
+            "DELETE",
+            &format!("/api/v1/modules/{module_id}"),
+            Some("Bearer top-secret"),
+            None,
+            &[],
+        );
+        assert!(deleted.starts_with("HTTP/1.1 204 No Content"));
+    }
+    let missing_module = management_request(
+        listen,
+        "GET",
+        &format!("/api/v1/modules/{module_id}"),
+        Some("Bearer top-secret"),
+        None,
+        &[],
+    );
+    assert!(missing_module.starts_with("HTTP/1.1 404 Not Found"));
 
     send_signal(node.id(), "TERM");
     let output = node.wait_with_output().expect("wait for nx serve");
