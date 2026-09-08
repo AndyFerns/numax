@@ -5,7 +5,7 @@ description: Numax vision, architecture and principles.
 
 
 > **Note**
-> This whitepaper is aligned with **v0.1.2**, the current stable Numax release.
+> This whitepaper is aligned with **v0.1.3**, the current stable Numax release.
 > Compared to previous drafts, most of the `TODO`s have been resolved based on the code present in the repository. What remains open is explicitly labeled as *(Planned)* and tracked in the roadmap.
 >
 > **Status labels (consistent with the code):**
