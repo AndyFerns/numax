@@ -6,6 +6,7 @@
 
 [![Docs](https://img.shields.io/badge/docs-site-blue)](https://gianiac.github.io/numax/)
 [![Whitepaper](https://img.shields.io/badge/docs-whitepaper-blue)](https://gianiac.github.io/numax/whitepaper/)
+[![Showcase](https://img.shields.io/badge/community-showcase-2ea44f)](https://gianiac.github.io/numax/showcase/)
 [![Good First Issues](https://img.shields.io/github/issues/GianIac/numax/good%20first%20issue?label=good%20first%20issues&color=7057ff)](https://github.com/GianIac/numax/issues?q=is%3Aopen+is%3Aissue+label%3A%22good+first+issue%22)
 [![Roadmap](https://img.shields.io/badge/project-roadmap-orange)](https://gianiac.github.io/numax/roadmap/)
 
@@ -140,6 +141,8 @@ Same module, any node. State stays local. Sync happens through the runtime.
 - [`Whitepaper`](https://gianiac.github.io/numax/whitepaper/) - the vision, the architecture, the principles.
 - [`Roadmap`](https://gianiac.github.io/numax/roadmap/) - where we are, where we're going, what's still missing.
 - [`Host API`](https://gianiac.github.io/numax/reference/host-api/) - the host API available to WASM modules.
+- [`examples/distributed_magnets`](./examples/distributed_magnets) - adaptive Magnetic Optimization Algorithm swarm.
+- [`examples/distributed_ants`](./examples/distributed_ants) - distributed Ant Colony Optimization swarm.
 - [`examples/distributed_inventory`](./examples/distributed_inventory) - replicated PNCounter inventory.
 - [`examples/distributed_status`](./examples/distributed_status) - replicated LWW-Register status.
 - [`examples/distributed_tags`](./examples/distributed_tags) - replicated ORSet tags.
