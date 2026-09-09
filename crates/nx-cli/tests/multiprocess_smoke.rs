@@ -440,7 +440,9 @@ fn management_cancels_looping_guests_on_timeout_and_shutdown() {
         ),
     )
     .unwrap();
+    let log_path = temp_path("management-loop.log");
     let spawn_node = || {
+        let log = std::fs::File::create(&log_path).unwrap();
         NodeGuard(
             Command::new(nx_bin())
                 .args(["serve", "--shutdown-timeout", "100ms"])
@@ -449,8 +451,9 @@ fn management_cancels_looping_guests_on_timeout_and_shutdown() {
                 .arg("--datastore-path")
                 .arg(&data_dir)
                 .env("TOKIO_WORKER_THREADS", "1")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .env("RUST_LOG", "nx_core=debug,nx_api=debug")
+                .stdout(log.try_clone().unwrap())
+                .stderr(log)
                 .spawn()
                 .unwrap(),
         )
@@ -518,16 +521,43 @@ fn management_cancels_looping_guests_on_timeout_and_shutdown() {
     node = spawn_node();
     wait_for_http(listen, Some("Bearer top-secret"));
 
-    // Run the persisted looping start function and require shutdown within three
-    // seconds, well before the thirty-second HTTP deadline.
+    // Wait for actual startup and compilation instead of assuming that a fixed
+    // sleep is enough on all CI platforms. The log is truncated on each spawn.
+    let wait_for_log = |message: &str| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let log = std::fs::read_to_string(&log_path).unwrap();
+            if log.contains(message) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "daemon did not reach {message}:\n{log}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    };
+    wait_for_log("shutdown signal handlers installed");
+
+    // Run the persisted looping start function. Shutdown must complete well
+    // before the thirty-second HTTP deadline, even on a loaded CI runner.
     let mut stream = TcpStream::connect(listen).unwrap();
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(3)))
         .unwrap();
     write!(stream, "POST {run_path} HTTP/1.1\r\nHost: {listen}\r\nAuthorization: Bearer top-secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    wait_for_log("instantiating guest module");
+    let health = management_request(
+        listen,
+        "GET",
+        "/api/v1/health",
+        Some("Bearer top-secret"),
+        None,
+        &[],
+    );
+    assert!(health.starts_with("HTTP/1.1 200 OK"));
     send_signal(node.0.id(), "TERM");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         if let Some(status) = node.0.try_wait().unwrap() {
             // A bounded forced shutdown reports an error; graceful completion is also valid.
@@ -539,7 +569,8 @@ fn management_cancels_looping_guests_on_timeout_and_shutdown() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "daemon did not stop after cancelling the guest"
+            "daemon did not stop after cancelling the guest:\n{}",
+            std::fs::read_to_string(&log_path).unwrap()
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }

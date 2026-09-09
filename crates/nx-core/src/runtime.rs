@@ -520,6 +520,7 @@ impl RuntimeExecutor {
         }
 
         // Instantiation
+        tracing::debug!(module_id = %module_key, "instantiating guest module");
         let instantiation_started = Instant::now();
         let instance = match self.linker.instantiate_async(&mut store, &module).await {
             Ok(instance) => instance,
