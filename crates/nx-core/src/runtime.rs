@@ -492,7 +492,15 @@ impl RuntimeExecutor {
         // Apply before instantiation, whose start function can also loop forever.
         // Yielding makes dropping the invocation future actually cancel the guest.
         store.set_epoch_deadline(1);
-        store.epoch_deadline_async_yield_and_update(1);
+        // Wasmtime's default yield immediately wakes the same task. A CPU-bound
+        // guest can then delay Tokio's I/O and signal driver across many polls.
+        // Use Tokio's cooperative yield so shutdown signals and timers get a turn.
+        store.epoch_deadline_callback(|_| {
+            Ok(wasmtime::UpdateDeadline::YieldCustom(
+                1,
+                Box::pin(tokio::task::yield_now()),
+            ))
+        });
 
         // Register the limiter so wasmtime enforces memory_size on every
         store.limiter(|state| &mut state.limits);
