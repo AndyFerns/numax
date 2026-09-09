@@ -11,7 +11,8 @@ CLI flags  >  NX_* environment variables  >  numax.toml  >  runtime defaults
 
 A later source only fills in what the earlier ones left unset.
 You can run a single node with nothing but CLI flags, or describe a full cluster
-with a TOML file and override individual fields at launch time.
+with a TOML file and override individual fields at launch time. The same node
+configuration is accepted by both `nx run` and `nx serve`.
 
 ---
 
@@ -64,6 +65,12 @@ insecure = false
 log_level = "info"
 log_format = "text"
 request_timeout_secs = 5
+
+[management]
+# listen = "127.0.0.1:9102"
+# token_file = "./management.token"
+allow_non_loopback = false
+request_timeout_secs = 10
 
 [limits]
 max_peers = 64
@@ -175,6 +182,38 @@ request_timeout_secs = 5
 
 ---
 
+## [management]
+
+Controls the authenticated Management API started by `nx serve`. The listener
+is disabled unless a bearer token is available. Store the token in a file or
+provide it through `NX_MANAGEMENT_TOKEN`; `nx config show` never prints it.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `listen` | string | `127.0.0.1:9102` | Management API address when a token is configured |
+| `token_file` | path | — | File containing the bearer token; trailing CR/LF characters are ignored |
+| `allow_non_loopback` | bool | `false` | Explicitly permit binding to a non-loopback address |
+| `request_timeout_secs` | integer | `10` | Maximum time to read HTTP headers and, separately, to execute a routed request. Must be > 0 |
+
+```toml
+[management]
+listen = "127.0.0.1:9102"
+token_file = "./management.token"
+allow_non_loopback = false
+request_timeout_secs = 10
+```
+
+The transport always caps request bodies at 16 MiB and processes at most 64
+authenticated requests concurrently. These hard safety bounds are not TOML
+settings.
+
+The Management API does not terminate TLS. Keep it on loopback behind a TLS-terminating reverse proxy whenever possible. A non-loopback bind requires
+`allow_non_loopback = true` and must only be used on a transport protected by
+TLS or equivalent network controls. Bearer tokens are never written to logs or
+effective configuration output.
+
+---
+
 ## [limits]
 
 Fine-grained control over sync behavior and resource bounds.
@@ -251,6 +290,11 @@ They are useful for secrets (TLS paths), container environments, and CI.
 | `NX_ALLOWED_PEERS` | string | `[tls].allowed_peers` | Comma-separated peer NodeId allowlist |
 | `NX_TLS_INSECURE` | bool | `[tls].insecure` | `1`, `true`, `yes`, `on` / `0`, `false`, `no`, `off` |
 | `NX_OBSERVABILITY_LISTEN` | string | `[observability].listen` | Metrics endpoint address |
+| `NX_MANAGEMENT_LISTEN` | string | `[management].listen` | Management API address |
+| `NX_MANAGEMENT_TOKEN` | string | secret | Bearer token; overrides every token file |
+| `NX_MANAGEMENT_TOKEN_FILE` | path | `[management].token_file` | Bearer-token file |
+| `NX_MANAGEMENT_ALLOW_NON_LOOPBACK` | bool | `[management].allow_non_loopback` | Explicit external-bind opt-in |
+| `NX_MANAGEMENT_REQUEST_TIMEOUT_SECS` | integer | `[management].request_timeout_secs` | HTTP header-read and routed-request timeout in seconds |
 | `NX_LOG_LEVEL` | string | `[observability].log_level` | `trace`, `debug`, `info`, `warn`, `error` |
 | `NX_LOG_FORMAT` | string | `[observability].log_format` | `text` or `json` |
 

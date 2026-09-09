@@ -60,6 +60,7 @@ export default defineConfig({
             { label: 'Writing host functions', slug: 'guides/writing-host-functions' },
             { label: 'Debugging WASM modules', slug: 'guides/debugging-wasm-modules' },
             { label: 'Observability', slug: 'guides/observability' },
+            { label: 'Management API', slug: 'guides/management-api' },
           ],
         },
         {

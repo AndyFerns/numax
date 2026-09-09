@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 use tokio::time::Instant;
 use wasmtime::{Engine, Linker, Module, Store, StoreLimitsBuilder};
@@ -11,6 +11,7 @@ use wasmtime_wasi::{WasiCtx, p1};
 use nx_store::Store as NxStore;
 use nx_sync::NodeId;
 
+use crate::control::{ModuleRegistry, RuntimeControlHandle};
 use crate::host_api;
 use crate::observability::{
     ObservabilityConfig, ObservabilityServer, RuntimeMetrics, start_server,
@@ -20,6 +21,43 @@ use crate::sync_manager::{SyncHandle, SyncManager};
 
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const NODE_ID_STORE_KEY: &[u8] = b"__nx/runtime/node_id";
+const WASM_EPOCH_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Advance epochs independently of Tokio: a guest may occupy its only worker.
+struct EpochTicker {
+    stop: Option<mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl EpochTicker {
+    fn start(engine: Engine) -> Result<Self> {
+        let (stop, receiver) = mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("nx-wasm-epochs".to_string())
+            .spawn(move || {
+                while matches!(
+                    receiver.recv_timeout(WASM_EPOCH_INTERVAL),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    engine.increment_epoch();
+                }
+            })?;
+        Ok(Self {
+            stop: Some(stop),
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for EpochTicker {
+    fn drop(&mut self) {
+        // Disconnecting wakes the ticker immediately, including on startup rollback.
+        self.stop.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownSignal {
@@ -74,13 +112,24 @@ pub struct HostState {
     pub limits: wasmtime::StoreLimits,
 }
 
-pub struct Runtime {
+pub(crate) struct RuntimeExecutor {
     engine: Engine,
+    _epoch_ticker: EpochTicker,
     linker: Linker<HostState>,
+    enable_wasi: bool,
+    max_memory_bytes: Option<u64>,
+    store: Arc<NxStore>,
+    metrics: Arc<RuntimeMetrics>,
+    sync_handle: Option<SyncHandle>,
+    module_cache: Mutex<HashMap<[u8; 32], Module>>,
+}
+
+pub struct Runtime {
+    executor: Arc<RuntimeExecutor>,
     config: RuntimeConfig,
     store: Arc<NxStore>,
     metrics: Arc<RuntimeMetrics>,
-    module_cache: Mutex<HashMap<[u8; 32], Module>>,
+    module_registry: ModuleRegistry,
 
     sync_manager: Option<SyncManager>,
     sync_handle: Option<SyncHandle>,
@@ -92,6 +141,7 @@ impl Runtime {
         // Engine: async support is required so wasmtime can yield across host calls
         let mut wasm_cfg = wasmtime::Config::new();
         wasm_cfg.wasm_backtrace_details(wasmtime::WasmBacktraceDetails::Enable);
+        wasm_cfg.epoch_interruption(true);
 
         let engine = Engine::new(&wasm_cfg)?;
         let mut linker: Linker<HostState> = Linker::new(&engine);
@@ -149,13 +199,25 @@ impl Runtime {
             (None, None)
         };
 
-        Ok(Self {
+        let executor = Arc::new(RuntimeExecutor {
+            _epoch_ticker: EpochTicker::start(engine.clone())?,
             engine,
             linker,
+            enable_wasi: config.enable_wasi,
+            max_memory_bytes: config.max_memory_bytes,
+            store: Arc::clone(&store),
+            metrics: Arc::clone(&metrics),
+            sync_handle: sync_handle.clone(),
+            module_cache: Mutex::new(HashMap::new()),
+        });
+        let module_registry = ModuleRegistry::new(Arc::clone(&store));
+
+        Ok(Self {
+            executor,
             config,
             store,
             metrics,
-            module_cache: Mutex::new(HashMap::new()),
+            module_registry,
             sync_manager,
             sync_handle,
             observability_server: None,
@@ -242,6 +304,17 @@ impl Runtime {
         self.sync_handle.is_some()
     }
 
+    /// Return the shared control-plane handle used by in-process management adapters.
+    pub fn control_handle(&self) -> RuntimeControlHandle {
+        RuntimeControlHandle::new(
+            Arc::clone(&self.executor),
+            self.module_registry.clone(),
+            Arc::clone(&self.store),
+            Arc::clone(&self.metrics),
+            self.sync_handle.clone(),
+        )
+    }
+
     /// Return the current value of a GCounter, if sync is enabled.
     pub async fn get_counter_value(&self, key: &str) -> Option<u64> {
         let manager = self.sync_manager.as_ref()?;
@@ -296,11 +369,27 @@ impl Runtime {
             return Ok(None);
         }
 
-        tracing::info!("runtime entering long-running sync mode");
+        Ok(Some(self.wait_until_shutdown_with(shutdown).await))
+    }
+
+    /// Keep the runtime alive until the process receives a shutdown signal.
+    ///
+    /// Unlike [`Self::serve`], this is independent from sync and is suitable
+    /// for daemon processes that may expose other runtime services.
+    pub async fn wait_until_shutdown(&self) -> ShutdownSignal {
+        self.wait_until_shutdown_with(wait_for_shutdown_signal())
+            .await
+    }
+
+    /// Testable variant of [`Self::wait_until_shutdown`].
+    pub async fn wait_until_shutdown_with<S>(&self, shutdown: S) -> ShutdownSignal
+    where
+        S: Future<Output = ShutdownSignal>,
+    {
+        tracing::info!("runtime waiting for shutdown");
         let signal = shutdown.await;
         tracing::info!(?signal, "runtime shutdown requested");
-
-        Ok(Some(signal))
+        signal
     }
 
     /// Keep sync alive for a bounded settle window, then return.
@@ -345,23 +434,41 @@ impl Runtime {
     }
 
     pub async fn run_module(&self, wasm_bytes: &[u8]) -> Result<()> {
+        self.executor
+            .run_module(wasm_bytes, &self.config.module_id)
+            .await
+    }
+
+    #[cfg(test)]
+    fn cached_module_count(&self) -> usize {
+        self.executor.cached_module_count()
+    }
+}
+
+impl RuntimeExecutor {
+    pub(crate) fn validate_module(&self, wasm_bytes: &[u8]) -> Result<()> {
+        Module::validate(&self.engine, wasm_bytes)
+            .map_err(|error| anyhow!("Invalid module (compile/validate): {error}"))
+    }
+
+    pub(crate) async fn run_module(&self, wasm_bytes: &[u8], module_id: &str) -> Result<()> {
         let module_hash = blake3::hash(wasm_bytes);
         let module_key = module_hash.to_hex().to_string();
 
         // handle shared to the DB
         let store_db = Arc::clone(&self.store);
-        let module_id: Arc<str> = Arc::from(self.config.module_id.as_str());
+        let module_id: Arc<str> = Arc::from(module_id);
 
         // Build per-invocation resource limits. max_memory_bytes is cast to usize;
         // on 32-bit hosts values above 4 GiB would truncate silently, but numax targets 64-bit hostswhere usize == u64, so the cast is lossless.
         let mut limits_builder = StoreLimitsBuilder::new();
-        if let Some(max_bytes) = self.config.max_memory_bytes {
+        if let Some(max_bytes) = self.max_memory_bytes {
             limits_builder = limits_builder.memory_size(max_bytes as usize);
         }
         let limits = limits_builder.build();
 
         // Builds the host state for this run
-        let host_state = if self.config.enable_wasi {
+        let host_state = if self.enable_wasi {
             let wasi = WasiCtx::builder().inherit_stdio().inherit_args().build_p1();
 
             HostState {
@@ -382,6 +489,18 @@ impl Runtime {
         };
 
         let mut store = Store::new(&self.engine, host_state);
+        // Apply before instantiation, whose start function can also loop forever.
+        // Yielding makes dropping the invocation future actually cancel the guest.
+        store.set_epoch_deadline(1);
+        // Wasmtime's default yield immediately wakes the same task. A CPU-bound
+        // guest can then delay Tokio's I/O and signal driver across many polls.
+        // Use Tokio's cooperative yield so shutdown signals and timers get a turn.
+        store.epoch_deadline_callback(|_| {
+            Ok(wasmtime::UpdateDeadline::YieldCustom(
+                1,
+                Box::pin(tokio::task::yield_now()),
+            ))
+        });
 
         // Register the limiter so wasmtime enforces memory_size on every
         store.limiter(|state| &mut state.limits);
@@ -409,6 +528,7 @@ impl Runtime {
         }
 
         // Instantiation
+        tracing::debug!(module_id = %module_key, "instantiating guest module");
         let instantiation_started = Instant::now();
         let instance = match self.linker.instantiate_async(&mut store, &module).await {
             Ok(instance) => instance,
@@ -480,7 +600,7 @@ impl Runtime {
     }
 
     #[cfg(test)]
-    fn cached_module_count(&self) -> usize {
+    pub(crate) fn cached_module_count(&self) -> usize {
         self.module_cache.lock().unwrap().len()
     }
 }
@@ -540,6 +660,7 @@ async fn wait_for_shutdown_signal() -> ShutdownSignal {
         }
     };
 
+    tracing::debug!("shutdown signal handlers installed");
     tokio::select! {
         _ = sigint.recv() => ShutdownSignal::Interrupt,
         _ = sigterm.recv() => ShutdownSignal::Terminate,
@@ -670,6 +791,33 @@ mod tests {
             .unwrap();
 
         assert_eq!(signal, None);
+    }
+
+    #[tokio::test]
+    async fn wait_until_shutdown_keeps_runtime_alive_without_sync() {
+        let config = RuntimeConfig {
+            datastore_path: temp_datastore_path("numax-runtime-daemon-nosync-test"),
+            ..RuntimeConfig::default()
+        };
+        let runtime = Runtime::new(config).unwrap();
+        let (_tx, rx) = oneshot::channel::<()>();
+
+        assert!(
+            timeout(
+                Duration::from_millis(25),
+                runtime.wait_until_shutdown_with(async {
+                    let _ = rx.await;
+                    ShutdownSignal::Interrupt
+                })
+            )
+            .await
+            .is_err()
+        );
+
+        let signal = runtime
+            .wait_until_shutdown_with(async { ShutdownSignal::Terminate })
+            .await;
+        assert_eq!(signal, ShutdownSignal::Terminate);
     }
 
     #[tokio::test]

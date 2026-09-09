@@ -5,15 +5,18 @@ use std::fs;
 use std::io::{self, Write};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{
-    Arg, ColorChoice, Command, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum,
+    Arg, Args, ColorChoice, Command, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum,
 };
 use clap_complete::{Shell, generate};
 use config::*;
+use nx_api::ManagementServer;
+use nx_core::SharedRuntimeControl;
 use nx_core::runtime::{DEFAULT_SHUTDOWN_TIMEOUT, Runtime, RuntimeConfig};
 use nx_core::sync_manager::{
     DEFAULT_MIGRATION_BATCH_BYTES, DEFAULT_MIGRATION_BATCH_SIZE, MigrationOptions,
@@ -21,6 +24,73 @@ use nx_core::sync_manager::{
 };
 use owo_colors::{OwoColorize, Stream};
 use tracing::info;
+
+#[derive(Args, Debug, Default)]
+struct NodeArgs {
+    /// Datastore directory path (default: ./nx-data)
+    #[arg(long, value_name = "PATH")]
+    datastore_path: Option<PathBuf>,
+
+    /// Path to a Numax TOML configuration file.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    /// Enable sync and listen on this address (e.g., "0.0.0.0:9000")
+    #[arg(long, value_name = "ADDR")]
+    listen: Option<String>,
+
+    /// Peer addresses to connect to (can be repeated). Requires --listen.
+    #[arg(long = "peer", value_name = "ADDR")]
+    peers: Vec<String>,
+
+    /// Maximum time allowed for shutdown before returning an error.
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    shutdown_timeout: Option<Duration>,
+
+    /// Enable verbose logging
+    #[arg(short, long)]
+    verbose: bool,
+
+    /// Logging level (trace, debug, info, warn, error).
+    #[arg(long, value_name = "LEVEL")]
+    log_level: Option<String>,
+
+    /// Logging format.
+    #[arg(long, value_enum, value_name = "FORMAT")]
+    log_format: Option<LogFormat>,
+
+    /// Enable the observability HTTP endpoint (e.g. "127.0.0.1:9100").
+    #[arg(long, value_name = "ADDR")]
+    observability_listen: Option<String>,
+
+    /// Expose Tokio task diagnostics to tokio-console (requires the tokio-console feature).
+    #[arg(long)]
+    tokio_console: bool,
+
+    /// Path to this node's TLS certificate (PEM)
+    #[arg(long, value_name = "PATH")]
+    tls_cert: Option<PathBuf>,
+
+    /// Path to this node's TLS private key (PEM)
+    #[arg(long, value_name = "PATH")]
+    tls_key: Option<PathBuf>,
+
+    /// Path to the CA certificate used to verify peers (PEM, enables mTLS)
+    #[arg(long, value_name = "PATH")]
+    tls_ca: Option<PathBuf>,
+
+    /// Comma-separated allowlist of peer NodeIds (hex). Requires --tls-ca.
+    #[arg(long, value_name = "ID1,ID2,...")]
+    allowed_peers: Option<String>,
+
+    /// Skip TLS certificate verification (DEVELOPMENT ONLY).
+    #[arg(long)]
+    tls_insecure: bool,
+
+    /// Use JSON for the sync wire protocol instead of bincode.
+    #[arg(long)]
+    debug_protocol: bool,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum ColorWhen {
@@ -140,21 +210,8 @@ enum Cli {
         /// Path to the .wasm module
         module: PathBuf,
 
-        /// Datastore directory path (default: ./nx-data)
-        #[arg(long, value_name = "PATH")]
-        datastore_path: Option<PathBuf>,
-
-        /// Path to a Numax TOML configuration file.
-        #[arg(long, value_name = "PATH")]
-        config: Option<PathBuf>,
-
-        /// Enable sync and listen on this address (e.g., "0.0.0.0:9000")
-        #[arg(long, value_name = "ADDR")]
-        listen: Option<String>,
-
-        /// Peer addresses to connect to (can be repeated). Requires --listen.
-        #[arg(long = "peer", value_name = "ADDR")]
-        peers: Vec<String>,
+        #[command(flatten)]
+        node: NodeArgs,
 
         /// Keep sync alive for a bounded duration after running the module (e.g. 500ms, 5s, 2m).
         #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
@@ -187,54 +244,12 @@ enum Cli {
         /// Print the final visible values of an RGA after settle/serve completes.
         #[arg(long, value_name = "KEY")]
         print_rga: Option<String>,
+    },
 
-        /// Maximum time allowed for shutdown before returning an error.
-        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
-        shutdown_timeout: Option<Duration>,
-
-        /// Enable verbose logging
-        #[arg(short, long)]
-        verbose: bool,
-
-        /// Logging level (trace, debug, info, warn, error).
-        #[arg(long, value_name = "LEVEL")]
-        log_level: Option<String>,
-
-        /// Logging format.
-        #[arg(long, value_enum, value_name = "FORMAT")]
-        log_format: Option<LogFormat>,
-
-        /// Enable the observability HTTP endpoint (e.g. "127.0.0.1:9100").
-        #[arg(long, value_name = "ADDR")]
-        observability_listen: Option<String>,
-
-        /// Expose Tokio task diagnostics to tokio-console (requires the tokio-console feature).
-        #[arg(long)]
-        tokio_console: bool,
-
-        /// Path to this node's TLS certificate (PEM)
-        #[arg(long, value_name = "PATH")]
-        tls_cert: Option<PathBuf>,
-
-        /// Path to this node's TLS private key (PEM)
-        #[arg(long, value_name = "PATH")]
-        tls_key: Option<PathBuf>,
-
-        /// Path to the CA certificate used to verify peers (PEM, enables mTLS)
-        #[arg(long, value_name = "PATH")]
-        tls_ca: Option<PathBuf>,
-
-        /// Comma-separated allowlist of peer NodeIds (hex). Requires --tls-ca.
-        #[arg(long, value_name = "ID1,ID2,...")]
-        allowed_peers: Option<String>,
-
-        /// Skip TLS certificate verification (DEVELOPMENT ONLY).
-        #[arg(long)]
-        tls_insecure: bool,
-
-        /// Use JSON for the sync wire protocol instead of bincode.
-        #[arg(long)]
-        debug_protocol: bool,
+    /// Start a Numax node without executing a WebAssembly module
+    Serve {
+        #[command(flatten)]
+        node: NodeArgs,
     },
 
     /// Inspect and validate Numax configuration files
@@ -340,14 +355,85 @@ fn main() {
     }
 }
 
+struct ResolvedNodeArgs {
+    effective: EffectiveRunConfig,
+    shutdown_timeout: Duration,
+    tokio_console: bool,
+}
+
+fn resolve_node_args(node: NodeArgs) -> Result<ResolvedNodeArgs> {
+    let NodeArgs {
+        datastore_path,
+        config,
+        listen,
+        peers,
+        shutdown_timeout,
+        verbose,
+        log_level,
+        log_format,
+        observability_listen,
+        tokio_console,
+        tls_cert,
+        tls_key,
+        tls_ca,
+        allowed_peers,
+        tls_insecure,
+        debug_protocol,
+    } = node;
+    let file_config = load_run_config(config.as_ref())?;
+    let cli = RunCliOptions {
+        datastore_path,
+        listen,
+        peers,
+        observability_listen,
+        tls_cert,
+        tls_key,
+        tls_ca,
+        allowed_peers,
+        tls_insecure,
+        debug_protocol,
+        verbose,
+        log_level,
+        log_format,
+    };
+
+    Ok(ResolvedNodeArgs {
+        effective: EffectiveRunConfig::resolve(cli, &file_config)?,
+        shutdown_timeout: shutdown_timeout.unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT),
+        tokio_console,
+    })
+}
+
+fn runtime_config_from_effective(
+    effective: EffectiveRunConfig,
+    module_id: Option<String>,
+) -> RuntimeConfig {
+    let mut config = RuntimeConfig::default();
+    if let Some(path) = effective.datastore_path {
+        config.datastore_path = path;
+    }
+    if let Some(module_id) = module_id {
+        config.module_id = module_id;
+    }
+    if let Some(sync) = effective.sync {
+        info!(
+            listen = ?sync.listen_addr,
+            peers = ?sync.peers,
+            tls = sync.tls.is_some(),
+            serialization_format = ?sync.serialization_format,
+            "sync enabled"
+        );
+        config.sync = Some(sync);
+    }
+    config.observability = effective.observability;
+    config
+}
+
 async fn real_main(cli: Cli) -> Result<()> {
     match cli {
         Cli::Run {
             module,
-            datastore_path,
-            config,
-            listen,
-            peers,
+            node,
             settle_for,
             wait_before_run,
             print_gcounter,
@@ -356,39 +442,16 @@ async fn real_main(cli: Cli) -> Result<()> {
             print_lww_map,
             print_orset,
             print_rga,
-            shutdown_timeout,
-            verbose,
-            log_level,
-            log_format,
-            observability_listen,
-            tokio_console,
-            tls_cert,
-            tls_key,
-            tls_ca,
-            allowed_peers,
-            tls_insecure,
-            debug_protocol,
         } => {
-            let file_config = load_run_config(config.as_ref())?;
-            let cli = RunCliOptions {
-                datastore_path,
-                listen,
-                peers,
-                observability_listen,
-                tls_cert,
-                tls_key,
-                tls_ca,
-                allowed_peers,
-                tls_insecure,
-                debug_protocol,
-                verbose,
-                log_level,
-                log_format,
-            };
-            let effective = EffectiveRunConfig::resolve(cli, &file_config)?;
+            let resolved = resolve_node_args(node)?;
+            let effective = resolved.effective;
 
             // Setup logging
-            init_logging(&effective.log_level, effective.log_format, tokio_console)?;
+            init_logging(
+                &effective.log_level,
+                effective.log_format,
+                resolved.tokio_console,
+            )?;
 
             validate_settle_mode(&effective.sync, settle_for)?;
             validate_wait_before_run(&effective.sync, wait_before_run)?;
@@ -402,23 +465,10 @@ async fn real_main(cli: Cli) -> Result<()> {
             // Read the wasm module
             let bytes = fs::read(&module)?;
 
-            // Build the runtime config
-            let mut cfg = RuntimeConfig::default();
-            if let Some(p) = effective.datastore_path {
-                cfg.datastore_path = p;
-            }
-            cfg.module_id = module.to_string_lossy().into_owned();
-            if let Some(s) = effective.sync {
-                info!(
-                    listen = ?s.listen_addr,
-                    peers = ?s.peers,
-                    tls = s.tls.is_some(),
-                    serialization_format = ?s.serialization_format,
-                    "sync enabled"
-                );
-                cfg.sync = Some(s);
-            }
-            cfg.observability = effective.observability;
+            let cfg = runtime_config_from_effective(
+                effective,
+                Some(module.to_string_lossy().into_owned()),
+            );
 
             let mut rt = Runtime::new(cfg)?;
             let run_result: Result<()> = async {
@@ -492,11 +542,55 @@ async fn real_main(cli: Cli) -> Result<()> {
             }
             .await;
 
-            let shutdown_result = rt
-                .shutdown_with_timeout(shutdown_timeout.unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT))
-                .await;
+            let shutdown_result = rt.shutdown_with_timeout(resolved.shutdown_timeout).await;
 
             run_result?;
+            shutdown_result?;
+        }
+        Cli::Serve { node } => {
+            let resolved = resolve_node_args(node)?;
+            let mut effective = resolved.effective;
+            init_logging(
+                &effective.log_level,
+                effective.log_format,
+                resolved.tokio_console,
+            )?;
+
+            let management_config = effective.management.take();
+            let has_active_service = effective.sync.is_some()
+                || effective.observability.is_some()
+                || management_config.is_some();
+            let cfg = runtime_config_from_effective(effective, None);
+            let mut rt = Runtime::new(cfg)?;
+            let mut management_server = None;
+            let serve_result: Result<()> = async {
+                rt.start_observability().await?;
+                rt.start_sync().await?;
+                if let Some(config) = management_config {
+                    let control: SharedRuntimeControl = Arc::new(rt.control_handle());
+                    management_server = Some(ManagementServer::start(config, control).await?);
+                }
+                if !has_active_service {
+                    tracing::warn!(
+                        "node has no sync or observability listener; waiting for shutdown"
+                    );
+                }
+                rt.wait_until_shutdown().await;
+                Ok(())
+            }
+            .await;
+
+            let shutdown_started = Instant::now();
+            let management_shutdown_result = match management_server {
+                Some(server) => server.shutdown(resolved.shutdown_timeout).await,
+                None => Ok(()),
+            };
+            let runtime_shutdown_timeout = resolved
+                .shutdown_timeout
+                .saturating_sub(shutdown_started.elapsed());
+            let shutdown_result = rt.shutdown_with_timeout(runtime_shutdown_timeout).await;
+            serve_result?;
+            management_shutdown_result?;
             shutdown_result?;
         }
         Cli::Config { command } => match command {
@@ -688,6 +782,12 @@ mod tests {
                 log_level: None,
                 log_format: None,
             }
+        }
+
+        #[test]
+        fn generated_config_template_is_valid() {
+            let config: RunFileConfig = toml::from_str(CONFIG_TEMPLATE).unwrap();
+            validate_run_file_config(&config).unwrap();
         }
 
         #[test]
@@ -907,6 +1007,86 @@ mod tests {
             assert_eq!(observability.log_level.as_deref(), Some("debug"));
             assert_eq!(observability.log_format, Some(LogFormat::Json));
             assert_eq!(observability.request_timeout_secs, Some(7));
+        }
+
+        #[test]
+        fn parses_management_toml() {
+            let cfg: RunFileConfig = toml::from_str(
+                r#"
+                [management]
+                listen = "127.0.0.1:9202"
+                token_file = "./management.token"
+                allow_non_loopback = false
+                request_timeout_secs = 7
+                "#,
+            )
+            .unwrap();
+
+            let management = cfg.management.unwrap();
+            assert_eq!(management.listen.as_deref(), Some("127.0.0.1:9202"));
+            assert_eq!(
+                management.token_file.as_deref(),
+                Some(std::path::Path::new("./management.token"))
+            );
+            assert_eq!(management.allow_non_loopback, Some(false));
+            assert_eq!(management.request_timeout_secs, Some(7));
+        }
+
+        #[test]
+        fn management_is_disabled_without_a_token() {
+            let config = ManagementFileConfig {
+                listen: Some("127.0.0.1:9202".into()),
+                token_file: None,
+                allow_non_loopback: None,
+                request_timeout_secs: None,
+            };
+
+            assert!(
+                build_management_config(&EnvRunConfig::default(), Some(&config))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn management_uses_environment_token_without_exposing_it() {
+            let env_config = EnvRunConfig {
+                management_token: Some(SecretValue::new("top-secret")),
+                management_listen: Some("127.0.0.1:9202".into()),
+                management_request_timeout_secs: Some(7),
+                ..EnvRunConfig::default()
+            };
+
+            let management = build_management_config(&env_config, None).unwrap().unwrap();
+            assert_eq!(management.listen_addr().to_string(), "127.0.0.1:9202");
+            assert_eq!(management.request_timeout(), Duration::from_secs(7));
+            assert!(!format!("{management:?}").contains("top-secret"));
+            assert!(!format!("{env_config:?}").contains("top-secret"));
+
+            let effective = EffectiveRunConfig {
+                datastore_path: None,
+                sync: None,
+                observability: None,
+                management: Some(management),
+                log_level: "info".into(),
+                log_format: LogFormat::Text,
+            };
+            let rendered = effective.render_effective_toml();
+            assert!(rendered.contains("token_configured = true"));
+            assert!(rendered.contains("request_timeout = \"7s\""));
+            assert!(!rendered.contains("top-secret"));
+        }
+
+        #[test]
+        fn management_rejects_non_loopback_without_opt_in() {
+            let env_config = EnvRunConfig {
+                management_token: Some(SecretValue::new("top-secret")),
+                management_listen: Some("0.0.0.0:9102".into()),
+                ..EnvRunConfig::default()
+            };
+
+            let error = build_management_config(&env_config, None).unwrap_err();
+            assert!(error.to_string().contains("allow_non_loopback"));
         }
 
         #[test]
@@ -1417,19 +1597,69 @@ mod tests {
         fn minimal_args() {
             let cli = Cli::try_parse_from(["nx", "run", "x.wasm"]).unwrap();
             match cli {
-                Cli::Run {
-                    module,
-                    peers,
-                    verbose,
-                    tls_insecure,
-                    ..
-                } => {
+                Cli::Run { module, node, .. } => {
                     assert_eq!(module, PathBuf::from("x.wasm"));
-                    assert!(peers.is_empty());
-                    assert!(!verbose);
-                    assert!(!tls_insecure);
+                    assert!(node.peers.is_empty());
+                    assert!(!node.verbose);
+                    assert!(!node.tls_insecure);
                 }
                 _ => panic!("expected run command"),
+            }
+        }
+
+        #[test]
+        fn serve_requires_no_module() {
+            let cli = Cli::try_parse_from(["nx", "serve"]).unwrap();
+            match cli {
+                Cli::Serve { node } => {
+                    assert!(node.peers.is_empty());
+                    assert!(node.config.is_none());
+                }
+                _ => panic!("expected serve command"),
+            }
+        }
+
+        #[test]
+        fn serve_rejects_module_argument() {
+            assert!(Cli::try_parse_from(["nx", "serve", "x.wasm"]).is_err());
+        }
+
+        #[test]
+        fn serve_rejects_run_only_flags() {
+            assert!(Cli::try_parse_from(["nx", "serve", "--settle-for", "5s"]).is_err());
+            assert!(Cli::try_parse_from(["nx", "serve", "--print-gcounter", "counter"]).is_err());
+        }
+
+        #[test]
+        fn serve_accepts_shared_node_flags() {
+            let cli = Cli::try_parse_from([
+                "nx",
+                "serve",
+                "--config",
+                "numax.toml",
+                "--datastore-path",
+                "/tmp/nx",
+                "--listen",
+                "127.0.0.1:9000",
+                "--peer",
+                "127.0.0.1:9001",
+                "--observability-listen",
+                "127.0.0.1:9100",
+                "--shutdown-timeout",
+                "10s",
+            ])
+            .unwrap();
+
+            match cli {
+                Cli::Serve { node } => {
+                    assert_eq!(node.config, Some(PathBuf::from("numax.toml")));
+                    assert_eq!(node.datastore_path, Some(PathBuf::from("/tmp/nx")));
+                    assert_eq!(node.listen.as_deref(), Some("127.0.0.1:9000"));
+                    assert_eq!(node.peers, vec!["127.0.0.1:9001"]);
+                    assert_eq!(node.observability_listen.as_deref(), Some("127.0.0.1:9100"));
+                    assert_eq!(node.shutdown_timeout, Some(Duration::from_secs(10)));
+                }
+                _ => panic!("expected serve command"),
             }
         }
 
@@ -1494,7 +1724,9 @@ mod tests {
             ])
             .unwrap();
             match cli {
-                Cli::Run { peers, .. } => assert_eq!(peers, vec!["a:1", "b:2", "c:3"]),
+                Cli::Run { node, .. } => {
+                    assert_eq!(node.peers, vec!["a:1", "b:2", "c:3"])
+                }
                 _ => panic!("expected run command"),
             }
         }
@@ -1503,7 +1735,7 @@ mod tests {
         fn verbose_short_flag() {
             let cli = Cli::try_parse_from(["nx", "run", "x.wasm", "-v"]).unwrap();
             match cli {
-                Cli::Run { verbose, .. } => assert!(verbose),
+                Cli::Run { node, .. } => assert!(node.verbose),
                 _ => panic!("expected run command"),
             }
         }
@@ -1512,7 +1744,7 @@ mod tests {
         fn verbose_long_flag() {
             let cli = Cli::try_parse_from(["nx", "run", "x.wasm", "--verbose"]).unwrap();
             match cli {
-                Cli::Run { verbose, .. } => assert!(verbose),
+                Cli::Run { node, .. } => assert!(node.verbose),
                 _ => panic!("expected run command"),
             }
         }
@@ -1522,8 +1754,8 @@ mod tests {
             let cli = Cli::try_parse_from(["nx", "run", "x.wasm", "--datastore-path", "/tmp/nx"])
                 .unwrap();
             match cli {
-                Cli::Run { datastore_path, .. } => {
-                    assert_eq!(datastore_path, Some(PathBuf::from("/tmp/nx")));
+                Cli::Run { node, .. } => {
+                    assert_eq!(node.datastore_path, Some(PathBuf::from("/tmp/nx")));
                 }
                 _ => panic!("expected run command"),
             }
@@ -1534,8 +1766,8 @@ mod tests {
             let cli =
                 Cli::try_parse_from(["nx", "run", "x.wasm", "--config", "numax.toml"]).unwrap();
             match cli {
-                Cli::Run { config, .. } => {
-                    assert_eq!(config, Some(PathBuf::from("numax.toml")));
+                Cli::Run { node, .. } => {
+                    assert_eq!(node.config, Some(PathBuf::from("numax.toml")));
                 }
                 _ => panic!("expected run command"),
             }
@@ -1686,15 +1918,10 @@ mod tests {
             ])
             .unwrap();
             match cli {
-                Cli::Run {
-                    observability_listen,
-                    log_level,
-                    log_format,
-                    ..
-                } => {
-                    assert_eq!(observability_listen.as_deref(), Some("127.0.0.1:9100"));
-                    assert_eq!(log_level.as_deref(), Some("debug"));
-                    assert_eq!(log_format, Some(LogFormat::Json));
+                Cli::Run { node, .. } => {
+                    assert_eq!(node.observability_listen.as_deref(), Some("127.0.0.1:9100"));
+                    assert_eq!(node.log_level.as_deref(), Some("debug"));
+                    assert_eq!(node.log_format, Some(LogFormat::Json));
                 }
                 _ => panic!("expected run command"),
             }
@@ -1704,7 +1931,7 @@ mod tests {
         fn tokio_console_flag_parsed() {
             let cli = Cli::try_parse_from(["nx", "run", "x.wasm", "--tokio-console"]).unwrap();
             match cli {
-                Cli::Run { tokio_console, .. } => assert!(tokio_console),
+                Cli::Run { node, .. } => assert!(node.tokio_console),
                 _ => panic!("expected run command"),
             }
         }
@@ -1714,8 +1941,8 @@ mod tests {
             let cli =
                 Cli::try_parse_from(["nx", "run", "x.wasm", "--listen", "127.0.0.1:9000"]).unwrap();
             match cli {
-                Cli::Run { listen, .. } => {
-                    assert_eq!(listen.as_deref(), Some("127.0.0.1:9000"));
+                Cli::Run { node, .. } => {
+                    assert_eq!(node.listen.as_deref(), Some("127.0.0.1:9000"));
                 }
                 _ => panic!("expected run command"),
             }
@@ -1725,7 +1952,7 @@ mod tests {
         fn debug_protocol_parsed() {
             let cli = Cli::try_parse_from(["nx", "run", "x.wasm", "--debug-protocol"]).unwrap();
             match cli {
-                Cli::Run { debug_protocol, .. } => assert!(debug_protocol),
+                Cli::Run { node, .. } => assert!(node.debug_protocol),
                 _ => panic!("expected run command"),
             }
         }
@@ -1860,10 +2087,8 @@ mod tests {
             let cli =
                 Cli::try_parse_from(["nx", "run", "x.wasm", "--shutdown-timeout", "10s"]).unwrap();
             match cli {
-                Cli::Run {
-                    shutdown_timeout, ..
-                } => {
-                    assert_eq!(shutdown_timeout, Some(Duration::from_secs(10)));
+                Cli::Run { node, .. } => {
+                    assert_eq!(node.shutdown_timeout, Some(Duration::from_secs(10)));
                 }
                 _ => panic!("expected run command"),
             }
@@ -1894,19 +2119,12 @@ mod tests {
             .expect("parse must succeed");
 
             match cli {
-                Cli::Run {
-                    tls_cert,
-                    tls_key,
-                    tls_ca,
-                    allowed_peers,
-                    tls_insecure,
-                    ..
-                } => {
-                    assert_eq!(tls_cert.unwrap().to_string_lossy(), "c.pem");
-                    assert_eq!(tls_key.unwrap().to_string_lossy(), "k.pem");
-                    assert_eq!(tls_ca.unwrap().to_string_lossy(), "ca.pem");
-                    assert_eq!(allowed_peers.as_deref(), Some("abc,def"));
-                    assert!(!tls_insecure);
+                Cli::Run { node, .. } => {
+                    assert_eq!(node.tls_cert.unwrap().to_string_lossy(), "c.pem");
+                    assert_eq!(node.tls_key.unwrap().to_string_lossy(), "k.pem");
+                    assert_eq!(node.tls_ca.unwrap().to_string_lossy(), "ca.pem");
+                    assert_eq!(node.allowed_peers.as_deref(), Some("abc,def"));
+                    assert!(!node.tls_insecure);
                 }
                 _ => panic!("expected run command"),
             }
@@ -1916,7 +2134,7 @@ mod tests {
         fn tls_insecure_flag_parsed() {
             let cli = Cli::try_parse_from(["nx", "run", "x.wasm", "--tls-insecure"]).unwrap();
             match cli {
-                Cli::Run { tls_insecure, .. } => assert!(tls_insecure),
+                Cli::Run { node, .. } => assert!(node.tls_insecure),
                 _ => panic!("expected run command"),
             }
         }

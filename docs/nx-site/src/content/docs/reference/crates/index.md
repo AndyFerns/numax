@@ -3,16 +3,17 @@ title: Crates
 description: Overview of the Numax Rust crates.
 ---
 
-Numax is a Cargo workspace with six crates. Each one owns a single layer of the stack.
+Numax is a Cargo workspace with seven crates. Each one owns a single layer of the stack.
 No crate reaches across its boundary.
 
 ```
 nx-cli
-  └── nx-core
-        ├── nx-store
-        ├── nx-sync
-        └── nx-net
-              └── nx-sync
+      ├── nx-core
+      │     ├── nx-store
+      │     ├── nx-sync
+      │     └── nx-net
+      │           └── nx-sync
+      └── nx-api
 
 nx-sdk          (standalone — targets wasm32, no internal deps)
 ```
@@ -21,9 +22,11 @@ nx-sdk          (standalone — targets wasm32, no internal deps)
 
 ## nx-cli
 
-**What it owns:** the `nx` binary. Configuration parsing, CLI flag validation, precedence resolution, logging setup.
+**What it owns:** the `nx` binary. Configuration parsing, CLI flag validation,
+precedence resolution, logging setup, and process lifecycle coordination.
 
-**Does not own:** runtime logic, WASM execution, networking. Everything below the CLI surface is delegated to `nx-core`.
+**Does not own:** runtime logic, WASM execution, networking, or HTTP serving.
+Those responsibilities are delegated to `nx-core` and `nx-api`.
 
 **Produces:** the `nx` executable.
 
@@ -145,12 +148,34 @@ Compiles to `wasm32-unknown-unknown`. Has no internal workspace dependencies and
 
 ---
 
+## nx-api
+
+**What it owns:** the Management API transport: listener binding, bearer
+authentication, body/header/request limits, concurrency admission, and bounded
+connection draining.
+
+**Does not own:** runtime operations. Endpoint handlers adapt the shared
+`RuntimeIntrospection` and `RuntimeManagement` interfaces from `nx-core` to the
+reviewed OpenAPI contract.
+
+**Key files:**
+- `src/lib.rs` - `ManagementConfig`, transport limits and `ManagementServer`
+- `src/routes.rs` - authenticated `/api/v1/*` handlers and HTTP error mapping
+
+**External dependencies:** `axum`, `base64`, `http-body-util`, `hyper`, `hyper-util`, `nx-core`, `serde`, `serde_json`, `tower`, `tokio`, `subtle`, `tracing`
+
+---
+
 ## Dependency graph in full
 
 ```
 nx-cli ──────────────────────────────────── bin: nx
   │
-  └── nx-core ──────────────────────────── runtime, host API, sync manager
+  ├── nx-api ─────────────────────────────  Management API adapter
+  │     │
+  │     └── nx-core
+  │
+  └── nx-core ──────────────────────────── runtime, host API, control, sync manager
         │
         ├── nx-store ─────────────────────  sled KV store
         │
