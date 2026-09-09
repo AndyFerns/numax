@@ -47,8 +47,8 @@ Unlike `v0.1.0` (declared for non-critical workloads), `v0.2.0` must guarantee:
 | `v0.1.1` | Architectural Cleanup & Versioning | released |
 | `v0.1.2` | Performance & Profiling | released |
 | `v0.1.3` | Supply Chain & Fuzzing | released |
-| `v0.1.4` | Management API | active |
-| `v0.1.5` | Peer Discovery - Foundations | planned |
+| `v0.1.4` | Management API | released |
+| `v0.1.5` | Peer Discovery - Foundations | active |
 | `v0.1.6` | Peer Discovery - SWIM & Gossip K-fanout | planned |
 | `v0.1.7` | Reactive Module Model - Events | planned |
 | `v0.1.8` | Reactive Module Model - HTTP & Hot Reload | planned |
@@ -136,54 +136,29 @@ a partially updated state.
 
 ## v0.1.4 - Management API 🔌
 
-**Goal**: provide a programmatic alternative to the CLI for integration with automation tooling.
+`v0.1.4` brings Numax back to shipping a major runtime capability: a node can
+now be operated programmatically, without ever invoking the CLI.
 
-**Daemon lifecycle**:
-- [x] `nx serve` starts a node without requiring a WASM module
-- [x] The daemon remains active when sync is disabled
-- [x] The Management API starts with `nx serve` when configured and shuts down gracefully with the daemon
+The release introduces `nx serve`, a daemon that starts a node without a WASM
+module and stays alive until a shutdown signal, and an authenticated REST API
+(default `127.0.0.1:9102`) served by the new `nx-api` crate. Every endpoint,
+including the health and readiness probes, requires a bearer token, binds to
+loopback unless an external bind is explicitly opted into, and follows a
+contract-first OpenAPI 3.1 spec validated in CI. The v1 surface registers,
+inspects, runs and deletes modules and exposes read-only peer, datastore and
+probe operations, all with a stable JSON error envelope, cursor pagination,
+binary-safe keys, and bounded bodies, timeouts and concurrency. Underneath,
+the new `RuntimeIntrospection` and `RuntimeManagement` interfaces in `nx-core`
+become the single source of truth for the CLI, the REST API and, later, the
+dashboard and TUI, backed by a persistent local module registry and
+cancellable one-shot guest execution via Wasmtime epoch interruption.
 
-**REST API `/api/v1/*`**:
-- [x] Served on a separate port (default `127.0.0.1:9102`)
-- [x] Auth with bearer token (never open without)
-- [x] Management API disabled when no bearer token is configured
-- [x] **Default**: bind only to `127.0.0.1`, external exposure must be explicit
-- [x] OpenAPI 3.1 spec in `docs/api/openapi.yaml`
+Net result: after starting the daemon, a Numax node can be managed exclusively
+through the authenticated REST API — the documented `curl` automation example
+registers, inspects and runs a module, then verifies readiness, without a
+single further CLI command.
 
-**API contract and safety**:
-- [x] Contract-first design: OpenAPI is reviewed before endpoint implementation
-- [x] Stable JSON error envelope with documented HTTP status codes
-- [x] Cursor-based pagination with bounded page and response sizes
-- [x] Binary-safe key and value encoding; internal `__nx/` keys are never exposed
-- [x] Bounded request bodies, request timeouts and concurrency limits
-- [x] Documented idempotency and retry semantics for every mutating endpoint
-- [x] Explicit authentication policy for health and readiness endpoints
-- [x] Non-loopback exposure requires an explicit opt-in and documented TLS or reverse-proxy protection
-
-**v1 endpoints**:
-- [x] `POST /api/v1/modules` - register a WASM module
-- [x] `GET /api/v1/modules` - list registered modules
-- [x] `GET /api/v1/modules/{id}` - inspect a registered module
-- [x] `DELETE /api/v1/modules/{id}` - remove a registered module
-- [x] `POST /api/v1/modules/{id}/runs` - execute a registered module once
-- [x] `GET /api/v1/peers` - list connected peers
-- [x] `GET /api/v1/keys?prefix=...` - list keys
-- [x] `GET /api/v1/keys/{key}` - read a value
-- [x] `GET /api/v1/health`, `GET /api/v1/ready` (aliases of existing observability endpoints)
-
-**Module lifecycle**:
-- [x] Registered modules are local artifacts with stable IDs
-- [x] Module execution remains one-shot; long-running modules and hot reload are out of scope
-
-**Internal pattern**:
-- [x] `RuntimeIntrospection` is the single source of truth for read-only operations used by CLI, REST API, dashboard and TUI
-- [x] `RuntimeManagement` is the single source of truth for mutating management operations
-
-**Automation example**:
-- [x] Reproducible example managing a node through the REST API with `curl` and a shell script
-
-**Closing criterion**:
-> After starting the daemon, a numax node can be managed exclusively via the authenticated REST API. The documented automation example registers, inspects and runs a module, then verifies node readiness without further CLI commands.
+📄 Full details in the [`v0.1.4` release notes](https://github.com/GianIac/numax/releases/tag/v0.1.4).
 
 ---
 
