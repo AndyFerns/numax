@@ -1,8 +1,7 @@
-//! Minimal Numax Python guest, powered by RustPython.
+//! Minimal Numax Python guest implemented in RustPython.
 //!
 //! Compiled to a *core* WebAssembly module (wasm32-wasip1), not a
-//! Component, so it loads via `wasmtime::Module` the same way the C,
-//! C++, and TinyGo guest examples do.
+//! Component, so it loads via `wasmtime::Module`
 
 use rustpython_vm::compiler::Mode;
 use rustpython_vm::Interpreter;
@@ -27,11 +26,7 @@ mod nx_ffi {
     }
 }
 
-/// The `nx` module as seen *inside* Python. Keeps the Python-facing API
-/// (`nx.log(...)`, `nx.db_set(...)`) separate from the raw pointer/length
-/// ABI used to cross the WASM boundary — C and C++ call the host
-/// functions directly since they have no namespace concept; Python needs
-/// something to hang `log`/`db_set` off of, so it's exposed as `nx.*`.
+/// The `nx` module as seen *inside* Python (`import nx; nx.log(...)`).
 #[rustpython_vm::pymodule]
 mod nx {
     use crate::nx_ffi;
@@ -40,7 +35,10 @@ mod nx {
 
     #[pyfunction]
     fn log(msg: PyStrRef, vm: &VirtualMachine) -> PyResult<()> {
-        let bytes = msg.as_str().as_bytes();
+        let s = msg
+            .to_str()
+            .ok_or_else(|| vm.new_value_error("nx.log: string contains surrogates".to_owned()))?;
+        let bytes = s.as_bytes();
         let rc = unsafe { nx_ffi::host_log_v2(bytes.as_ptr(), bytes.len() as u32) };
         if rc < 0 {
             return Err(vm.new_runtime_error(format!("nx.log failed (code {rc})")));
@@ -50,8 +48,14 @@ mod nx {
 
     #[pyfunction]
     fn db_set(key: PyStrRef, value: PyStrRef, vm: &VirtualMachine) -> PyResult<i32> {
-        let k = key.as_str().as_bytes();
-        let v = value.as_str().as_bytes();
+        let k = key
+            .to_str()
+            .ok_or_else(|| vm.new_value_error("nx.db_set: key contains surrogates".to_owned()))?
+            .as_bytes();
+        let v = value
+            .to_str()
+            .ok_or_else(|| vm.new_value_error("nx.db_set: value contains surrogates".to_owned()))?
+            .as_bytes();
         let rc = unsafe { nx_ffi::db_set(k.as_ptr(), k.len() as u32, v.as_ptr(), v.len() as u32) };
         if rc < 0 {
             return Err(vm.new_runtime_error(format!("nx.db_set failed (code {rc})")));
@@ -61,19 +65,16 @@ mod nx {
 }
 
 /// exported guest entrypoint expected by Numax.
-/// Mirrors `func run()` in TinyGo and `void run()` in C/C++.
 #[no_mangle]
 pub extern "C" fn run() {
-    let interp = Interpreter::without_stdlib(Default::default());
+    // Native modules must be registered on the builder *before* the
+    // interpreter is built (rustpython-vm 0.5's InterpreterBuilder).
+    let builder = Interpreter::builder(Default::default());
+    let nx_def = nx::module_def(&builder.ctx);
+    let interp = builder.add_native_module(nx_def).build();
 
     interp.enter(|vm| {
         let scope = vm.new_scope_with_builtins();
-
-        let nx_module = nx::make_module(vm);
-        if let Err(exc) = scope.globals.set_item("nx", nx_module, vm) {
-            vm.print_exception(exc);
-            return;
-        }
 
         let source = include_str!("guest.py");
         let code_obj = match vm.compile(source, Mode::Exec, "<guest.py>".to_owned()) {
