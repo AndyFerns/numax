@@ -12,12 +12,13 @@ Minimal Python guest example for Numax, using RustPython embedded in a tiny Rust
 
 - `guest.py` is embedded into the binary at compile time (`include_str!`)
   — no filesystem access needed at runtime.
-- A tiny native `nx` module is registered directly as a Python global
-  (`nx.log`, `nx.db_set`), backed by raw `extern "C"` imports from the
-  `nx` namespace: `host_log_v2` and `db_set`.
-- RustPython runs *without* the standard library (`Interpreter::without_stdlib`)
-  since the example needs nothing beyond Python builtins — this avoids
-  needing to freeze/embed the stdlib into the WASM binary.
+- A native `nx` module is registered on RustPython's `InterpreterBuilder`
+  before the interpreter is built, exposing `nx.log` and `nx.db_set` to
+  Python via `import nx`. Those calls are backed by raw `extern "C"`
+  imports from the `nx` namespace: `host_log_v2` and `db_set`.
+- No standard library is registered on the builder — only Python
+  builtins are available (`import os`, `import sys`, etc. won't work)
+  — this avoids needing to freeze/embed the stdlib into the WASM binary.
 - The compiled module exports a single `run` function, matching the
   C/C++/TinyGo guests.
 
@@ -34,13 +35,13 @@ From the repository root:
 
 ```bash
 cd examples/guest_python
-./build.sh
+./build.bat
 ```
 
 ### Linux / macOS
 
 ```bash
-cd examples/guest_cpp
+cd examples/guest_python
 chmod +x build.sh
 ./build.sh
 ```
@@ -73,7 +74,7 @@ From the repository root
 ## Details
 
 - Python: 3.12 semantics via RustPython (not CPython)
-- RustPython: `rustpython-vm = "0.4"` from crates.io
+- RustPython: `rustpython-vm = "0.5"` from crates.io
 - WASM target: `wasm32-wasip1`
 - Tested on: Windows
 
