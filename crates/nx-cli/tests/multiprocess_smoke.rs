@@ -1,5 +1,8 @@
+#[cfg(unix)]
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::TcpListener;
+#[cfg(unix)]
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -437,19 +440,22 @@ fn management_cancels_looping_guests_on_timeout_and_shutdown() {
         ),
     )
     .unwrap();
-    let mut node = NodeGuard(
-        Command::new(nx_bin())
-            .args(["serve", "--shutdown-timeout", "100ms"])
-            .arg("--config")
-            .arg(&config_path)
-            .arg("--datastore-path")
-            .arg(&data_dir)
-            .env("TOKIO_WORKER_THREADS", "1")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
+    let spawn_node = || {
+        NodeGuard(
+            Command::new(nx_bin())
+                .args(["serve", "--shutdown-timeout", "100ms"])
+                .arg("--config")
+                .arg(&config_path)
+                .arg("--datastore-path")
+                .arg(&data_dir)
+                .env("TOKIO_WORKER_THREADS", "1")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let mut node = spawn_node();
     wait_for_http(listen, Some("Bearer top-secret"));
 
     let mut run_path = String::new();
@@ -498,7 +504,22 @@ fn management_cancels_looping_guests_on_timeout_and_shutdown() {
         assert!(health.starts_with("HTTP/1.1 200 OK"));
     }
 
-    // Start a cached, looping start function again and stop before its HTTP timeout.
+    // Use a separate, long HTTP deadline for the shutdown check. With the one-second
+    // deadline above, a descheduled CI test process can send SIGTERM only after the
+    // request has already timed out, incorrectly reporting a cancellation failure.
+    node.0.kill().unwrap();
+    node.0.wait().unwrap();
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    std::fs::write(
+        &config_path,
+        config.replace("request_timeout_secs = 1", "request_timeout_secs = 30"),
+    )
+    .unwrap();
+    node = spawn_node();
+    wait_for_http(listen, Some("Bearer top-secret"));
+
+    // Run the persisted looping start function and require shutdown within three
+    // seconds, well before the thirty-second HTTP deadline.
     let mut stream = TcpStream::connect(listen).unwrap();
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(3)))
